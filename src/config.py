@@ -1,6 +1,6 @@
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 EUDOXIA_REV = "c62122cd15eca36d8872f7f9204d2f9c30774b28"
 SCALES = [1, 2, 4, 8, 16]
 TRACE = ROOT / "scenarios/bench_canonical_train.csv"

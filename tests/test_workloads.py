@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scenarios.make_workloads import FIELDS, SOURCE_HASHES, build_family, main, sha256, validate_family
-from config import ROOT, get_canonical_base_params
+from src.config import ROOT, get_canonical_base_params
 
 
 class WorkloadTests(unittest.TestCase):

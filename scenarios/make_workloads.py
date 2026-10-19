@@ -18,7 +18,7 @@ from pathlib import Path
 from eudoxia.workload.csv_io import CSVOperatorRow, CSVWorkloadReader
 from eudoxia.workload.pipeline import Segment
 
-from config import EUDOXIA_REV, ROOT, SCALES, get_canonical_base_params
+from src.config import EUDOXIA_REV, ROOT, SCALES, get_canonical_base_params
 
 FIELDS = list(CSVOperatorRow._fields)
 CONDITIONS = ('simple', 'medium', 'hard')
@@ -209,11 +209,11 @@ def main():
         report.update({key: value for key, value in previous.items() if key.startswith('seed_evaluation')})
     write_json(output / 'validation.json', report)
     if args.check_seed:
-        from evaluator import evaluate_scheduler
+        from src.evaluator import evaluate_scheduler
         report['seed_evaluations'] = {}
         for name in config['trace_sha256']:
             print(f'Full seed evaluation: {name}', flush=True)
-            evaluation = evaluate_scheduler(ROOT / 'seed.py', trace=output / name)
+            evaluation = evaluate_scheduler(ROOT / 'src/seed.py', trace=output / name)
             report['seed_evaluations'][name] = evaluation
             write_json(output / 'validation.json', report)
         report['seed_evaluations_passed'] = all(e['ok'] for e in report['seed_evaluations'].values())

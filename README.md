@@ -14,13 +14,13 @@ Set `OPENAI_API_KEY` in `.env`.
 Check without model calls:
 
 ```sh
-uv run python run.py --mode both --iterations 0 --prototype
+uv run python -m src.run --mode both --iterations 0 --prototype
 ```
 
 Run both methods with a target of $2 each (spending may exceed the target):
 
 ```sh
-uv run python run.py --mode both --budget-usd 2 \
+uv run python -m src.run --mode both --budget-usd 2 \
   --budget-guard --budget-slack-usd 0.10 --iterations 1000
 ```
 
@@ -38,3 +38,5 @@ uv run python -m scenarios.make_workloads --validate-only
 ```sh
 uv run python -m unittest discover -s tests -v
 ```
+
+Adapted from [Bauplan](https://github.com/BauplanLabs/AI-for-Distributed-System-Design), [Eudoxia](https://github.com/BauplanLabs/eudoxia), and [summer2026](https://github.com/BauplanLabs/wiscurds-playground/tree/aeac04a9360e95a2beff3c30af025f307248d05c/summer2026).

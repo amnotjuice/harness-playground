@@ -17,7 +17,7 @@ import math
 import sys
 from pathlib import Path
 
-from config import RESOURCE_TOLERANCE
+from .config import RESOURCE_TOLERANCE
 
 
 def validate_code(code):

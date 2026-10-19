@@ -11,10 +11,10 @@ from importlib.metadata import version
 from pathlib import Path
 
 from dotenv import load_dotenv
-from config import ROOT, EUDOXIA_REV, SCALES, TRACE, RESOURCE_TOLERANCE, default_agent_timeout, get_canonical_base_params
-from evaluator import evaluate_scheduler
-from generators import build_prompt, detect_opencode, generate_direct, generate_opencode, validate_code, write_json
-from selection import SELECTOR_MAX_TOKENS, select_parent
+from .config import ROOT, EUDOXIA_REV, SCALES, TRACE, RESOURCE_TOLERANCE, default_agent_timeout, get_canonical_base_params
+from .evaluator import evaluate_scheduler
+from .generators import build_prompt, detect_opencode, generate_direct, generate_opencode, validate_code, write_json
+from .selection import SELECTOR_MAX_TOKENS, select_parent
 
 
 def best_candidate(pool):
@@ -92,7 +92,7 @@ def run_arm(arm, args, summary, save, *, generator=None, selector='best'):
         directory = arm_dir / ('000_seed' if iteration == 0 else f'{iteration:03d}')
         directory.mkdir(parents=True)
         parent = best_candidate(pool) if pool else None
-        source = Path(parent['path']) / 'scheduler.py' if parent else ROOT / 'seed.py'
+        source = Path(parent['path']) / 'scheduler.py' if parent else ROOT / 'src/seed.py'
         shutil.copyfile(source, directory / 'scheduler.py')
         generation_usage = {'input_tokens': None, 'output_tokens': None, 'estimated_cost_usd': 0.0,
                  'observed_cost_usd': 0.0, 'model_invocations': 0}
@@ -226,9 +226,11 @@ def run_arm(arm, args, summary, save, *, generator=None, selector='best'):
 
 def snapshot_experiment(output, trace=TRACE):
     """Explicit allowlist: capture research inputs, never .env or credentials."""
-    names = ['run.py', 'config.py', 'evaluator.py', 'worker.py', 'generators.py',
-             'feedback.py', 'seed.py', 'analysis.py', 'selection.py', 'pyproject.toml', 'uv.lock', 'opencode.json',
-             'prompts/system.md', 'prompts/context.md', 'prompts/selection.md']
+    names = ['src/' + name for name in [
+        '__init__.py', 'run.py', 'config.py', 'evaluator.py', 'worker.py', 'generators.py',
+        'feedback.py', 'seed.py', 'analysis.py', 'selection.py', 'opencode.json',
+        'prompts/system.md', 'prompts/context.md', 'prompts/selection.md']]
+    names += ['pyproject.toml', 'uv.lock']
     hashes = {}
     for name in names:
         source = ROOT / name
@@ -306,7 +308,7 @@ def main():
     if (args.output / 'run_config.json').exists() or (args.output / 'results.json').exists() or any(
         (args.output / 'candidates' / arm).exists() and any((args.output / 'candidates' / arm).iterdir()) for arm in arms):
         parser.error('Output already contains results. Use --output runs/NEW_NAME for a fresh experiment.')
-    validate_code((ROOT / 'seed.py').read_text())
+    validate_code((ROOT / 'src/seed.py').read_text())
     args.output.mkdir(parents=True, exist_ok=True)
     run_config = {'schema_version': 3, **snapshot_experiment(args.output, args.trace),
                'mode': args.mode, 'eudoxia_revision': EUDOXIA_REV, 'prototype': args.prototype,
@@ -348,7 +350,7 @@ def main():
     summary['status'] = 'needs_attention' if failed else 'complete'
     summary['finished_at_utc'] = datetime.now(timezone.utc).isoformat()
     save()
-    from analysis import write_analysis, plot_analysis
+    from .analysis import write_analysis, plot_analysis
     report = write_analysis(args.output, summary)
     plot_analysis(args.output, report)
     print(f'Results: {args.output / "results.json"}')

@@ -98,7 +98,7 @@ def write_analysis(directory, summary):
 
 
 def plot_analysis(directory, report, *, detail=False):
-    from config import ROOT
+    from .config import ROOT
     os.environ.setdefault('MPLCONFIGDIR', str(ROOT / '.tools/state/cache/matplotlib'))
     import matplotlib
     matplotlib.use('Agg')

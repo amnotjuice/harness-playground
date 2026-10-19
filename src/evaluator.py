@@ -9,11 +9,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from config import ROOT, SCALES, TRACE, RESOURCE_TOLERANCE, get_canonical_base_params
+from .config import ROOT, SCALES, TRACE, RESOURCE_TOLERANCE, get_canonical_base_params
 
 
 def evaluate_scheduler(scheduler_path: Path, *, prototype=False, trace=TRACE, scales=None):
-    for path in (scheduler_path, trace, ROOT / 'worker.py'):
+    for path in (scheduler_path, trace, ROOT / 'src/worker.py'):
         if not path.is_file():
             raise FileNotFoundError(f'Evaluation input missing: {path}')
     params = get_canonical_base_params(prototype)
@@ -27,7 +27,7 @@ def evaluate_scheduler(scheduler_path: Path, *, prototype=False, trace=TRACE, sc
                       ram_gb_per_pool=params['ram_gb_per_pool'] * scale)
         try:
             proc = subprocess.run(
-                [sys.executable, str(ROOT / 'worker.py'), str(scheduler_path.resolve()),
+                [sys.executable, '-m', 'src.worker', str(scheduler_path.resolve()),
                  str(trace.resolve()), json.dumps(scaled)],
                 capture_output=True, text=True, cwd=ROOT,
                 timeout=params['subprocess_timeout'])

@@ -10,9 +10,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from config import ROOT, TRACE, default_agent_timeout
-from feedback import get_iteration_feedback_prompt
-from worker import validate_code
+from .config import ROOT, TRACE, default_agent_timeout
+from .feedback import get_iteration_feedback_prompt
+from .worker import validate_code
 
 
 def write_json(path, data):
@@ -20,8 +20,8 @@ def write_json(path, data):
 
 
 def build_prompt(code, evaluation):
-    system = (ROOT / 'prompts/system.md').read_text(encoding='utf-8-sig').replace(
-        '{context}', (ROOT / 'prompts/context.md').read_text(encoding='utf-8-sig'))
+    system = (ROOT / 'src/prompts/system.md').read_text(encoding='utf-8-sig').replace(
+        '{context}', (ROOT / 'src/prompts/context.md').read_text(encoding='utf-8-sig'))
     return system.rstrip() + '\n\n' + get_iteration_feedback_prompt(code, evaluation)
 
 
@@ -48,13 +48,13 @@ Leave the final policy in scheduler.py for independent evaluation.
 def write_evaluation_launcher(work, *, prototype=False, trace=TRACE):
     """Resolve this machine's paths at setup; expose only ./evaluate to the agent."""
     work = work.resolve()
-    command = [sys.executable, str(ROOT / 'evaluator.py'),
+    command = [sys.executable, '-m', 'src.evaluator',
                '--scheduler', str(work / 'scheduler.py'),
                '--output-dir', str(work.parent / 'internal_evals'), '--trace', str(trace.resolve())]
     if prototype:
         command.append('--prototype')
     launcher = work / 'evaluate'
-    launcher.write_text('#!/bin/sh\nexec ' + shlex.join(command) + '\n')
+    launcher.write_text('#!/bin/sh\ncd ' + shlex.quote(str(ROOT)) + ' || exit 1\nexec ' + shlex.join(command) + '\n')
     launcher.chmod(0o700)
     return launcher
 
@@ -66,7 +66,7 @@ def call_llm(directory, prompt, model, timeout, accounting, *, reasoning_effort=
     # catalogs lack this new model. Long-context/other-tier pricing stays unknown.
     if model == 'openai/gpt-6.1-sol':
         try:
-            prices = json.loads((ROOT / 'opencode.json').read_text())['provider']['openai']['models']['gpt-6.1-sol']['cost']
+            prices = json.loads((ROOT / 'src/opencode.json').read_text())['provider']['openai']['models']['gpt-6.1-sol']['cost']
             if any(not math.isfinite(prices[key]) or prices[key] < 0
                    for key in ('input', 'output', 'cache_read', 'cache_write')):
                 raise ValueError('Prices must be finite and nonnegative')
@@ -130,7 +130,7 @@ def opencode_environment():
     env = os.environ.copy()
     for kind in ('DATA', 'CONFIG', 'CACHE', 'STATE'):
         env[f'XDG_{kind}_HOME'] = str(ROOT / '.tools/state' / kind.lower())
-    env['OPENCODE_CONFIG'] = str(ROOT / 'opencode.json')
+    env['OPENCODE_CONFIG'] = str(ROOT / 'src/opencode.json')
     return env
 
 

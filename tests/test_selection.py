@@ -6,9 +6,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from config import ROOT, TRACE
-import run
-import selection
+from src.config import ROOT, TRACE
+from src import run
+from src import selection
 
 
 class SelectionTests(unittest.TestCase):
@@ -17,7 +17,7 @@ class SelectionTests(unittest.TestCase):
         for name, score in [('000_seed', 10), ('001', 20)]:
             folder = root / name
             folder.mkdir()
-            (folder / 'scheduler.py').write_text((ROOT / 'seed.py').read_text())
+            (folder / 'scheduler.py').write_text((ROOT / 'src/seed.py').read_text())
             pool.append({'path': str(folder), 'iteration': len(pool),
                          'evaluation': {'ok': True, 'score': score, 'params': {}, 'scale_results': {}}})
         return pool

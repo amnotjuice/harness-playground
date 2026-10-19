@@ -8,22 +8,22 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import generators
-import run
-from analysis import summarize_arm, write_analysis
-from config import ROOT, TRACE
+from src import generators
+from src import run
+from src.analysis import summarize_arm, write_analysis
+from src.config import ROOT, TRACE
 
 
 class ExperimentTests(unittest.TestCase):
     def test_evaluator_launch_error_propagates_but_timeout_is_a_candidate_failure(self):
-        import evaluator
+        from src import evaluator
         import subprocess
         with patch.object(evaluator.subprocess, 'run', side_effect=FileNotFoundError('python missing')) as call:
             with self.assertRaisesRegex(FileNotFoundError, 'python missing'):
-                evaluator.evaluate_scheduler(ROOT / 'seed.py')
+                evaluator.evaluate_scheduler(ROOT / 'src/seed.py')
             self.assertEqual(call.call_count, 1)
         with patch.object(evaluator.subprocess, 'run', side_effect=subprocess.TimeoutExpired('worker', 180)):
-            result = evaluator.evaluate_scheduler(ROOT / 'seed.py')
+            result = evaluator.evaluate_scheduler(ROOT / 'src/seed.py')
         self.assertFalse(result['ok'])
         self.assertIsNone(result['score'])
         self.assertEqual(len(result['scale_results']), 5)
@@ -54,7 +54,7 @@ class ExperimentTests(unittest.TestCase):
     def test_pricing_failure_keeps_response_and_is_recorded_as_fatal(self):
         from types import SimpleNamespace
         response = SimpleNamespace(model_dump=lambda **kw: {'fixture': True},
-            choices=[SimpleNamespace(message=SimpleNamespace(content=(ROOT / 'seed.py').read_text()))],
+            choices=[SimpleNamespace(message=SimpleNamespace(content=(ROOT / 'src/seed.py').read_text()))],
             usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5))
         with tempfile.TemporaryDirectory() as temp:
             args = argparse.Namespace(output=Path(temp), trace=TRACE, iterations=3,
@@ -80,9 +80,10 @@ class ExperimentTests(unittest.TestCase):
             usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5))
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            config = json.loads((ROOT / 'opencode.json').read_text())
+            config = json.loads((ROOT / 'src/opencode.json').read_text())
             config['provider']['openai']['models']['gpt-6.1-sol']['cost']['input'] = 7
-            (root / 'opencode.json').write_text(json.dumps(config))
+            (root / 'src').mkdir()
+            (root / 'src/opencode.json').write_text(json.dumps(config))
             with patch.object(generators, 'ROOT', root), \
                  patch('litellm.register_model') as register, \
                  patch('litellm.completion', return_value=response), \
@@ -173,7 +174,7 @@ class ExperimentTests(unittest.TestCase):
 
     def test_resource_rounding_is_tolerated_but_invalid_allocations_are_rejected(self):
         from types import SimpleNamespace
-        from worker import verify_valid_assignment
+        from src.worker import verify_valid_assignment
         pool = SimpleNamespace(avail_cpu_pool=.3, avail_ram_pool=.3, allow_memory_overcommit=False)
         assignments = [SimpleNamespace(cpu=.1, ram=.1), SimpleNamespace(cpu=.2, ram=.2)]
         # Ordinary binary-float addition exceeds .3 by one representable step.
@@ -195,8 +196,8 @@ class ExperimentTests(unittest.TestCase):
             verify_valid_assignment(pool, assignments)
 
     def test_registration_contract_accepts_python_spacing_and_rejects_duplicates(self):
-        from worker import validate_code
-        code = (ROOT / 'seed.py').read_text().replace('key="experiment"', ' key = "experiment", ')
+        from src.worker import validate_code
+        code = (ROOT / 'src/seed.py').read_text().replace('key="experiment"', ' key = "experiment", ')
         self.assertEqual(validate_code(code), code)
         with self.assertRaises(ValueError):
             validate_code(code + '\n@register_scheduler("experiment")\ndef extra(s): pass\n')
@@ -322,14 +323,14 @@ class ExperimentTests(unittest.TestCase):
 
     def test_failed_scale_is_ineligible_and_resources_scale(self):
         import subprocess
-        import evaluator
+        from src import evaluator
         calls = []
         def worker(command, **kwargs):
             calls.append(json.loads(command[-1]))
             data = {'ok': True, 'latency': 10} if len(calls) == 1 else {'ok': False, 'error': 'test'}
             return subprocess.CompletedProcess(command, 0, '__RESULT__' + json.dumps(data), '')
-        with patch('evaluator.subprocess.run', side_effect=worker):
-            result = evaluator.evaluate_scheduler(ROOT / 'seed.py', prototype=True, scales=[1, 2])
+        with patch('src.evaluator.subprocess.run', side_effect=worker):
+            result = evaluator.evaluate_scheduler(ROOT / 'src/seed.py', prototype=True, scales=[1, 2])
         self.assertFalse(result['ok'])
         self.assertIsNone(result['score'])
         self.assertEqual([c['cpus_per_pool'] for c in calls], [64, 128])
@@ -347,7 +348,7 @@ class ExperimentTests(unittest.TestCase):
         self.assertIsNone(generators.parse_opencode_usage('garbage')['estimated_cost_usd'])
 
     def test_detection_missing(self):
-        with patch('generators.shutil.which', return_value=None), patch('generators.Path.is_file', return_value=False):
+        with patch('src.generators.shutil.which', return_value=None), patch('src.generators.Path.is_file', return_value=False):
             with self.assertRaisesRegex(RuntimeError, 'not installed'):
                 generators.detect_opencode()
 
@@ -403,7 +404,7 @@ class ExperimentTests(unittest.TestCase):
                      'register_scheduler_init': lambda **kw: lambda f: f,
                      'OperatorState': OperatorState, 'ASSIGNABLE_STATES': ASSIGNABLE_STATES,
                      'Assignment': lambda **kw: SimpleNamespace(**kw)}
-        exec((ROOT / 'seed.py').read_text(), namespace)
+        exec((ROOT / 'src/seed.py').read_text(), namespace)
         pool = SimpleNamespace(avail_cpu_pool=64, avail_ram_pool=500)
         state = SimpleNamespace(params={'multi_operator_containers': False},
                                 executor=SimpleNamespace(num_pools=1, pools=[pool]))
@@ -433,7 +434,7 @@ class ExperimentTests(unittest.TestCase):
     def test_invalid_scheduler(self):
         with self.assertRaises(ValueError):
             generators.validate_code('def x(): pass')
-        generators.validate_code((ROOT / 'seed.py').read_text())
+        generators.validate_code((ROOT / 'src/seed.py').read_text())
 
     def test_opencode_process_failures_and_edit(self):
         # Exercise real subprocess execution with an explicitly fake local CLI.
@@ -443,7 +444,7 @@ class ExperimentTests(unittest.TestCase):
             for behavior in ['unchanged', 'missing', 'invalid', 'nonzero', 'timeout', 'success']:
                 directory = base / behavior
                 directory.mkdir()
-                (directory / 'scheduler.py').write_text((ROOT / 'seed.py').read_text())
+                (directory / 'scheduler.py').write_text((ROOT / 'src/seed.py').read_text())
                 body = {'unchanged': 'pass', 'nonzero': 'raise SystemExit(2)',
                         'missing': 'from pathlib import Path\nPath("scheduler.py").unlink()',
                         'invalid': 'from pathlib import Path\nPath("scheduler.py").write_text("def broken(:")',
@@ -453,13 +454,13 @@ class ExperimentTests(unittest.TestCase):
                                'assert os.environ["PWD"] == os.getcwd()\n'
                                'assert sys.argv[sys.argv.index("--dir") + 1] == os.getcwd()\n' + body + '\n')
                 cli.chmod(0o755)
-                with patch('generators.detect_opencode', return_value=(str(cli), '--model --format')):
+                with patch('src.generators.detect_opencode', return_value=(str(cli), '--model --format')):
                     if behavior in ('success', 'unchanged'):
                         generators.generate_opencode(directory, 'task', 'fake', 2, {}, prototype=True)
                         if behavior == 'success':
                             self.assertIn('# edited', (directory / 'scheduler.py').read_text())
                         else:
-                            self.assertEqual((directory / 'scheduler.py').read_bytes(), (ROOT / 'seed.py').read_bytes())
+                            self.assertEqual((directory / 'scheduler.py').read_bytes(), (ROOT / 'src/seed.py').read_bytes())
                         rendered = (directory / 'workspace/task.md').read_text()
                         self.assertEqual(rendered, (directory / 'prompt.txt').read_text())
                         self.assertIn('./evaluate', rendered)
@@ -476,7 +477,7 @@ class ExperimentTests(unittest.TestCase):
         from unittest.mock import Mock
         response = Mock()
         response.model_dump.return_value = {'test_fixture': True}
-        response.choices = [Mock(message=Mock(content='```python\n' + (ROOT / 'seed.py').read_text() + '\n```'))]
+        response.choices = [Mock(message=Mock(content='```python\n' + (ROOT / 'src/seed.py').read_text() + '\n```'))]
         response.usage = Mock(prompt_tokens=10, completion_tokens=20)
         with tempfile.TemporaryDirectory() as temp, \
              patch('litellm.completion', return_value=response) as call, \
@@ -569,7 +570,7 @@ class ExperimentTests(unittest.TestCase):
                 self.assertIsNone(usage['estimated_cost_usd'])
 
     def test_agent_timeout_allows_full_evaluations_and_is_shown_in_prompt(self):
-        from config import default_agent_timeout
+        from src.config import default_agent_timeout
         self.assertEqual(default_agent_timeout(), 2100)
         self.assertEqual(default_agent_timeout(prototype=True), 1500)
         self.assertEqual(default_agent_timeout(direct_timeout=60), 1860)
@@ -579,7 +580,7 @@ class ExperimentTests(unittest.TestCase):
 
     def test_prompt_retains_evolved_metric_and_diagnostics_without_archive_metadata(self):
         from copy import deepcopy
-        from config import get_canonical_base_params
+        from src.config import get_canonical_base_params
         stats = {
             'ok': True, 'latency': 123.4567, 'failures': 9, 'oom_count': 7,
             'failure_error_counts': {'OOM': 7, 'OTHER': 2},
@@ -597,7 +598,7 @@ class ExperimentTests(unittest.TestCase):
         }
         # Nondefault penalty/settings catch stale canonical constants in prompts.
         evaluation['params']['max_job_seconds'] = 37
-        code = (ROOT / 'seed.py').read_text()
+        code = (ROOT / 'src/seed.py').read_text()
         before = deepcopy(evaluation)
         prompt = generators.build_prompt(code, evaluation)
         self.assertEqual(evaluation, before)
@@ -639,7 +640,9 @@ class ExperimentTests(unittest.TestCase):
             root = Path(temp).resolve() / "project with spaces and 'quote $value"
             root.mkdir()
             # A stand-in evaluator reports its argv; no simulator or model calls.
-            (root / 'evaluator.py').write_text(
+            (root / 'src').mkdir()
+            (root / 'src/__init__.py').write_text('')
+            (root / 'src/evaluator.py').write_text(
                 'import json, sys\nprint(json.dumps({"python": sys.executable, "args": sys.argv[1:]}))\n')
             work = root / 'candidate' / 'workspace'
             work.mkdir(parents=True)
@@ -659,7 +662,7 @@ class ExperimentTests(unittest.TestCase):
     def test_self_evaluation_archives_each_attempt_and_uses_matching_mode(self):
         import contextlib
         import io
-        import evaluator
+        from src import evaluator
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
             source = directory / 'scheduler.py'

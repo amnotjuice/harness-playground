@@ -3,8 +3,8 @@ import json
 import time
 from pathlib import Path
 
-from config import ROOT
-from generators import call_llm, write_json
+from .config import ROOT
+from .generators import call_llm, write_json
 
 SELECTOR_MAX_TOKENS = 4096
 
@@ -39,7 +39,7 @@ def select_parent(pool, trajectory, directory, *, strategy, generator, model,
             payload = {'generator': generator, 'remaining_budget_usd': remaining_budget,
                        'evaluation_params': valid[0]['evaluation'].get('params', {}),
                        'candidates': records}
-            prompt = (ROOT / 'prompts/selection.md').read_text() + '\n\n' + json.dumps(payload, indent=2)
+            prompt = (ROOT / 'src/prompts/selection.md').read_text() + '\n\n' + json.dumps(payload, indent=2)
             folder = directory / 'selection'
             folder.mkdir()
             usage['estimated_cost_usd'] = None
