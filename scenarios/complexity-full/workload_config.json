@@ -1,0 +1,69 @@
+{
+  "schema_version": 2,
+  "created_at_utc": "2026-10-19T06:14:17.725191+00:00",
+  "eudoxia_revision": "c62122cd15eca36d8872f7f9204d2f9c30774b28",
+  "generator_sha256": "ce4f9ac916f71f06fcb295b6403a0a9dfdaf1ffa23e57a3aa69859560a6fd612",
+  "seeds": {
+    "train": 42,
+    "test": 137
+  },
+  "jobs_per_split": {
+    "train": 4110,
+    "test": 4030
+  },
+  "simulation_params": {
+    "duration": 3600,
+    "ticks_per_second": 100,
+    "waiting_seconds_mean": 10.0,
+    "num_pipelines": 10,
+    "num_operators": 10,
+    "num_segs": 1,
+    "interactive_prob": 0.3,
+    "query_prob": 0.1,
+    "batch_prob": 0.6,
+    "dag_linear_prob": 1.0,
+    "dag_branch_in_prob": 0.0,
+    "dag_branch_out_prob": 0.0,
+    "cpu_io_ratio": 0.5,
+    "scheduler_algo": "priority",
+    "rest_scheduler_addr": "localhost:8080",
+    "rest_poll_interval": 1.0,
+    "num_pools": 1,
+    "cpus_per_pool": 64,
+    "ram_gb_per_pool": 500,
+    "multi_operator_containers": false,
+    "allow_memory_overcommit": false,
+    "random_seed": 42,
+    "max_job_seconds": 360,
+    "estimator_algo": "",
+    "noisy_estimator_sigma": 0.0,
+    "per_trace_timeout": null,
+    "subprocess_timeout": 180
+  },
+  "arrival_window_seconds": 3600,
+  "source_reference_revision": "aeac04a9360e95a2beff3c30af025f307248d05c",
+  "construction": "Hard = full canonical CSV; Medium = first root per job; Simple = Medium at t=0",
+  "work_matching": false,
+  "limitation": "Hard has more total CPU/I/O work and possible concurrent RAM demand. No work or memory equivalence is claimed. Late arrivals receive less than a full job deadline before the 3600-second horizon, as in the canonical protocol.",
+  "sources": {
+    "train": {
+      "file": "bench_canonical_train.csv",
+      "sha256": "832d4427aa98385a50205ea1c81b387f8ce49e27430772ede4ec1b3febe694f9",
+      "url": "https://github.com/BauplanLabs/wiscurds-playground/blob/aeac04a9360e95a2beff3c30af025f307248d05c/summer2026/scenarios/traces/v1/bench_canonical_train.csv"
+    },
+    "test": {
+      "file": "bench_canonical_test.csv",
+      "sha256": "af5e5f27ba0065b78c1f98075afaaee4f9ffdd784dbd7c7ddcc7d0ae8fb269d4",
+      "url": "https://github.com/BauplanLabs/wiscurds-playground/blob/aeac04a9360e95a2beff3c30af025f307248d05c/summer2026/scenarios/traces/v1/bench_canonical_test.csv"
+    }
+  },
+  "trace_sha256": {
+    "train/simple.csv": "40e5fce82a414ed20f07785d9d53de9f06960d1a3bd24769fda0e6ef845bd639",
+    "train/medium.csv": "78add029bfce879a03b90267b078b3b9c01fe42e039b359295ad53686778ee4d",
+    "train/hard.csv": "832d4427aa98385a50205ea1c81b387f8ce49e27430772ede4ec1b3febe694f9",
+    "test/simple.csv": "ab01d551b9d73c3980a797f0721591689303ad640da44e0ddb72fbee2835de6b",
+    "test/medium.csv": "f1b4255cdbb47d8e29a0c2635cd427859874b11302e97b72cb24560e468f4865",
+    "test/hard.csv": "af5e5f27ba0065b78c1f98075afaaee4f9ffdd784dbd7c7ddcc7d0ae8fb269d4"
+  },
+  "byte_reproduction_verified": true
+}

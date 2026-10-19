@@ -1,0 +1,23 @@
+# Credentials and local runtime
+.env
+.env.*
+!.env.example
+.venv/
+.tools/
+__pycache__/
+*.py[cod]
+.DS_Store
+.pytest_cache/
+
+# Experiment outputs (including older layouts)
+runs/
+candidates/
+results.json
+
+# Historical pilot and local simulation validation
+scenarios/complexity/
+scenarios/complexity-full/validation.json
+
+# Local documentation
+docs/
+AGENTS.md

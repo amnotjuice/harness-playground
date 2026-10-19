@@ -1,0 +1,12 @@
+[project]
+name = "harness-experiment"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["eudoxia", "litellm>=1.77.5", "python-dotenv>=1.1.1", "setuptools", "matplotlib>=3.9"]
+
+[tool.uv]
+package = false
+no-build-isolation-package = ["eudoxia"]
+
+[tool.uv.sources]
+eudoxia = { git = "https://github.com/BauplanLabs/eudoxia", rev = "c62122cd15eca36d8872f7f9204d2f9c30774b28" }
