@@ -38,5 +38,3 @@ uv run python -m scenarios.make_workloads --validate-only
 ```sh
 uv run python -m unittest discover -s tests -v
 ```
-
-Adapted from [Bauplan](https://github.com/BauplanLabs/AI-for-Distributed-System-Design), [Eudoxia](https://github.com/BauplanLabs/eudoxia), and [summer2026](https://github.com/BauplanLabs/wiscurds-playground/tree/aeac04a9360e95a2beff3c30af025f307248d05c/summer2026).
