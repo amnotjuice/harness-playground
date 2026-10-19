@@ -26,8 +26,8 @@ uv run python -m src.run --mode both --budget-usd 2 \
 
 Results are saved under `runs/`.
 
-Simple / Medium / Hard inputs are in `scenarios/complexity-full/`. Select one with
-`--trace scenarios/complexity-full/train/simple.csv`. Validate the inputs with:
+Simple / Medium / Hard inputs are in `scenarios/`. Select one with
+`--trace scenarios/train/simple.csv`. Validate the inputs with:
 
 ```sh
 uv run python -m scenarios.make_workloads --validate-only

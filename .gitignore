@@ -16,7 +16,7 @@ results.json
 
 # Historical pilot and local simulation validation
 scenarios/complexity/
-scenarios/complexity-full/validation.json
+scenarios/validation.json
 
 # Local documentation
 docs/

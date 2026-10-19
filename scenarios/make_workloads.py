@@ -147,7 +147,7 @@ def write_json(path, data):
 def main():
     logging.getLogger('eudoxia').setLevel(logging.WARNING)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output', type=Path, default=ROOT / 'scenarios/complexity-full')
+    parser.add_argument('--output', type=Path, default=ROOT / 'scenarios')
     parser.add_argument('--validate-only', action='store_true')
     parser.add_argument('--check-seed', action='store_true', help='also full-evaluate naive on all 6 traces and 5 scales; no API')
     args = parser.parse_args()

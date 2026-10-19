@@ -228,7 +228,7 @@ def snapshot_experiment(output, trace=TRACE):
     """Explicit allowlist: capture research inputs, never .env or credentials."""
     names = ['src/' + name for name in [
         '__init__.py', 'run.py', 'config.py', 'evaluator.py', 'worker.py', 'generators.py',
-        'feedback.py', 'seed.py', 'analysis.py', 'selection.py', 'opencode.json',
+        'seed.py', 'analysis.py', 'selection.py', 'opencode.json',
         'prompts/system.md', 'prompts/context.md', 'prompts/selection.md']]
     names += ['pyproject.toml', 'uv.lock']
     hashes = {}
