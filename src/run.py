@@ -17,6 +17,10 @@ from .generators import build_prompt, detect_opencode, generate_direct, generate
 from .selection import SELECTOR_MAX_TOKENS, select_parent
 
 
+MODES = {'direct': ['direct'], 'opencode': ['opencode'], 'opencode_noeval': ['opencode_noeval'],
+         'both': ['direct', 'opencode'], 'all': ['direct', 'opencode', 'opencode_noeval']}
+
+
 def best_candidate(pool):
     valid = [c for c in pool if c['evaluation'].get('ok') and c['evaluation'].get('score') is not None]
     return min(valid, key=lambda c: c['evaluation']['score']) if valid else pool[0]
@@ -126,7 +130,8 @@ def run_arm(arm, args, summary, save, *, generator=None, selector='best'):
                         generate_direct(directory, prompt, model, args.timeout, generation_usage)
                     else:
                         generate_opencode(directory, prompt, model, args.agent_timeout, generation_usage,
-                                          prototype=args.prototype, trace=args.trace)
+                                          prototype=args.prototype, trace=args.trace,
+                                          self_eval=generator == 'opencode')
             except (SyntaxError, ValueError, TimeoutError) as exc:
                 # Invalid/missing candidate code or a deadline consumes an attempt.
                 error = f'{type(exc).__name__}: {exc}'
@@ -264,7 +269,8 @@ def snapshot_experiment(output, trace=TRACE):
 def main():
     load_dotenv(ROOT / '.env')
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--mode', choices=['direct', 'opencode', 'both'], default=os.getenv('RUN_MODE', 'both'))
+    parser.add_argument('--mode', choices=list(MODES), default=os.getenv('RUN_MODE', 'both'),
+                        help='both: direct and opencode; all: also opencode_noeval (the agent without ./evaluate)')
     parser.add_argument('--selector', choices=['best', 'llm', 'compare'], default='best',
                         help='compare runs best and llm selectors with the same generator')
     parser.add_argument('--iterations', type=int, default=os.getenv('MAX_ITERATIONS', '3'), help='generated children per arm; 0 evaluates seeds only')
@@ -280,8 +286,8 @@ def main():
                         help='OpenCode session seconds; default: --timeout plus two full evaluator timeout budgets')
     parser.add_argument('--output', type=Path, default=None, help='default: a fresh timestamped directory under runs/')
     args = parser.parse_args()
-    if args.selector == 'compare' and args.mode == 'both':
-        parser.error('--selector compare requires one generator: --mode direct or opencode')
+    if args.selector == 'compare' and len(MODES[args.mode]) > 1:
+        parser.error('--selector compare requires one generator: --mode direct, opencode or opencode_noeval')
     args.trace = args.trace.resolve()
     if not args.trace.is_file():
         parser.error(f'Trace file does not exist: {args.trace}')
@@ -297,7 +303,7 @@ def main():
         stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
         args.output = ROOT / 'runs' / f'experiment-{stamp}'
     args.output = args.output.resolve()
-    generators = ['direct', 'opencode'] if args.mode == 'both' else [args.mode]
+    generators = MODES[args.mode]
     selectors = ['best', 'llm'] if args.selector == 'compare' else [args.selector]
     conditions = [(f'{g}_{s}' if args.selector == 'compare' else g, g, s)
                   for g in generators for s in selectors]
@@ -309,7 +315,7 @@ def main():
                 parser.error(f'Set the model for {arm} in {ROOT / ".env"}')
             if model.startswith('openai/') and not os.getenv('OPENAI_API_KEY'):
                 parser.error(f'Fill OPENAI_API_KEY in {ROOT / ".env"} before running')
-            if arm == 'opencode':
+            if arm.startswith('opencode'):
                 try:
                     detect_opencode()
                 except (RuntimeError, OSError, TimeoutError) as exc:

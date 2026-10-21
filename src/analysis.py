@@ -109,10 +109,10 @@ def plot_analysis(directory, report, *, detail=False):
              ('time', 'Elapsed time per arm (hours)', 3600, False)]
     if detail:
         views.append(('cost', 'Cumulative API cost (USD)', 1, True))
-    names = {'direct': 'Direct LLM', 'opencode': 'OpenCode Agent',
+    names = {'direct': 'Direct LLM', 'opencode': 'OpenCode Agent', 'opencode_noeval': 'OpenCode, no evaluator',
              'opencode_best': 'OpenCode + best-score', 'opencode_llm': 'OpenCode + LLM-select',
              'direct_best': 'Direct + best-score', 'direct_llm': 'Direct + LLM-select'}
-    colors = {'direct': '#2878B5', 'opencode': '#E07B39',
+    colors = {'direct': '#2878B5', 'opencode': '#E07B39', 'opencode_noeval': '#5A9E6F',
               'opencode_best': '#2878B5', 'opencode_llm': '#E07B39'}
     for axis, xlabel, divisor, zoom in views:
         key = 'cumulative_cost_usd' if axis == 'cost' else 'cumulative_elapsed_seconds'
@@ -207,6 +207,9 @@ def sweep_rows(directory):
                    'status': summary.get('status'), 'stop_reason': result['stop_reason'],
                    'attempts': result['attempts'], 'known_cost_usd': result['known_cost_usd'],
                    'cost_complete': result['cost_complete'], 'seed_score': seed,
+                   'attempts_with_repo_access': sum(
+                       bool(r.get('generation_usage', {}).get('agent_access', {}).get('markers'))
+                       for r in data['trajectory']),
                    'best_within_budget': within['best_score'] if within else None,
                    'train_ratio': within['best_score'] / seed if within and seed else None,
                    'test_ratio': None, 'generalization_gap': None}

@@ -466,8 +466,12 @@ class ExperimentTests(unittest.TestCase):
                         self.assertIn('./evaluate', rendered)
                         self.assertIn('--prototype', (directory / 'workspace/evaluate').read_text())
                         command = json.loads((directory / 'command.json').read_text())
-                        self.assertEqual(command['argv'][command['argv'].index('--dir') + 1],
-                                         str((directory / 'workspace').resolve()))
+                        # The agent works outside the repository; its workspace is copied back.
+                        agent_dir = Path(command['argv'][command['argv'].index('--dir') + 1])
+                        self.assertFalse(agent_dir.is_relative_to(ROOT))
+                        self.assertFalse(agent_dir.exists())
+                        self.assertIn(str((directory / 'internal_evals').resolve()),
+                                      (directory / 'workspace/evaluate').read_text())
                     else:
                         with self.assertRaises((RuntimeError, ValueError, SyntaxError, TimeoutError)):
                             generators.generate_opencode(directory, 'task', 'fake', .1 if behavior == 'timeout' else 2, {})

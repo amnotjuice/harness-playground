@@ -8,6 +8,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from .config import ROOT, TRACE, default_agent_timeout
@@ -122,9 +123,17 @@ def render_direct_prompt(prompt):
     return prompt + '\n## Delivery\nReturn ONLY the complete Python scheduler code. No Markdown fences or prose outside the code.\n'
 
 
-def render_opencode_prompt(prompt, *, prototype=False, timeout=None):
+def render_opencode_prompt(prompt, *, prototype=False, timeout=None, self_eval=True):
     if timeout is None:
         timeout = default_agent_timeout(prototype)
+    if not self_eval:
+        return prompt + f'''\n## Delivery
+Edit scheduler.py within this session's {timeout:g}-second limit. No evaluator
+is available in this session: do not run the simulator, the evaluator or the
+scheduler. Reason from the code and the evaluation feedback above.
+
+Leave the final policy in scheduler.py for independent evaluation.
+'''
     return prompt + f'''\n## Delivery
 Edit scheduler.py. You may test and revise it within this session's
 {timeout:g}-second limit by running:
@@ -138,12 +147,13 @@ Leave the final policy in scheduler.py for independent evaluation.
 '''
 
 
-def write_evaluation_launcher(work, *, prototype=False, trace=TRACE):
+def write_evaluation_launcher(work, output_dir=None, *, prototype=False, trace=TRACE):
     """Resolve this machine's paths at setup; expose only ./evaluate to the agent."""
     work = work.resolve()
+    output_dir = (work.parent / 'internal_evals') if output_dir is None else Path(output_dir).resolve()
     command = [sys.executable, '-m', 'src.evaluator',
                '--scheduler', str(work / 'scheduler.py'),
-               '--output-dir', str(work.parent / 'internal_evals'), '--trace', str(trace.resolve())]
+               '--output-dir', str(output_dir), '--trace', str(trace.resolve())]
     if prototype:
         command.append('--prototype')
     launcher = work / 'evaluate'
@@ -267,38 +277,83 @@ def parse_opencode_usage(stdout):
             'errors': errors, 'step_usage': list(steps.values())}
 
 
-def generate_opencode(directory, prompt, model, timeout, accounting, *, prototype=False, trace=TRACE):
-    rendered = render_opencode_prompt(prompt, prototype=prototype, timeout=timeout)
+# Tool inputs containing these suggest the agent reached the simulator, the
+# evaluation code, the workloads or the harness repository itself. Calling the
+# provided ./evaluate is counted separately because one arm is meant to use it.
+ACCESS_MARKERS = ('src.evaluator', 'src/evaluator', 'src.worker', 'src/worker', 'eudoxia', 'scenarios/')
+
+
+def audit_agent_access(stdout, root=ROOT):
+    """Record tool calls that touch evaluation or the repository; never blocks the run."""
+    markers = ACCESS_MARKERS + (str(root),)
+    hits = []
+    self_eval_calls = 0
+    def inputs(value, inside=False):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                yield from inputs(item, inside or key == 'input')
+        elif isinstance(value, list):
+            for item in value:
+                yield from inputs(item, inside)
+        elif inside and isinstance(value, str):
+            yield value
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        # Only what the agent asked a tool to do; tool output and prose may quote the prompt.
+        if not isinstance(event, dict) or 'tool' not in str(event.get('type', '')):
+            continue
+        for text in inputs(event.get('part', event)):
+            self_eval_calls += './evaluate' in text
+            found = sorted(m for m in markers if m in text)
+            if found:
+                hits.append({'markers': found, 'input': text[:300]})
+    return {'markers': sorted({m for h in hits for m in h['markers']}), 'tool_calls': hits,
+            'self_eval_calls': self_eval_calls}
+
+
+def generate_opencode(directory, prompt, model, timeout, accounting, *, prototype=False, trace=TRACE,
+                      self_eval=True):
+    rendered = render_opencode_prompt(prompt, prototype=prototype, timeout=timeout, self_eval=self_eval)
     (directory / 'prompt.txt').write_text(rendered)
     executable, help_text = detect_opencode()
     (directory / 'opencode-help.txt').write_text(help_text)
-    # Separate the agent's mutable workspace from the immutable evaluation artifacts.
-    work = directory / 'workspace'
-    work.mkdir()
-    write_evaluation_launcher(work, prototype=prototype, trace=trace)
+    # Outside the repository, so the agent's project holds only its task; copied back afterwards.
+    work = Path(tempfile.mkdtemp(prefix='scheduler-agent-')).resolve()
+    if self_eval:
+        write_evaluation_launcher(work, directory / 'internal_evals', prototype=prototype, trace=trace)
     original = (directory / 'scheduler.py').read_text()
     (work / 'scheduler.py').write_text(original)
     (work / 'task.md').write_text(rendered)
-    cmd = [executable, 'run', '--dir', str(work.resolve()), '--model', model, '--format', 'json']
+    cmd = [executable, 'run', '--dir', str(work), '--model', model, '--format', 'json']
     if os.getenv('OPENCODE_VARIANT'):
         cmd += ['--variant', os.environ['OPENCODE_VARIANT']]
     cmd += ['Read task.md and edit scheduler.py as instructed.']
-    write_json(directory / 'command.json', {'argv': cmd, 'cwd': str(work.resolve())})
+    write_json(directory / 'command.json', {'argv': cmd, 'cwd': str(work), 'self_eval': self_eval})
     env = opencode_environment()
     # OpenCode resolves its root from PWD before falling back to process.cwd().
     # subprocess cwd alone leaves the parent's PWD pointing at the project root.
-    env['PWD'] = str(work.resolve())
-    with (directory / 'response.txt').open('w') as out, (directory / 'stderr.txt').open('w') as err:
-        proc = subprocess.Popen(cmd, cwd=work, stdout=out, stderr=err, start_new_session=True, env=env)
-        timed_out = False
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            os.killpg(proc.pid, signal.SIGKILL)
-            proc.wait()
-    accounting.update(parse_opencode_usage((directory / 'response.txt').read_text()))
-    result = work / 'scheduler.py'
+    env['PWD'] = str(work)
+    try:
+        with (directory / 'response.txt').open('w') as out, (directory / 'stderr.txt').open('w') as err:
+            proc = subprocess.Popen(cmd, cwd=work, stdout=out, stderr=err, start_new_session=True, env=env)
+            timed_out = False
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+    finally:
+        # Links stay links, so nothing the agent pointed at outside is copied in.
+        shutil.copytree(work, directory / 'workspace', symlinks=True)
+        shutil.rmtree(work, ignore_errors=True)
+    stdout = (directory / 'response.txt').read_text()
+    accounting.update(parse_opencode_usage(stdout))
+    accounting['agent_access'] = audit_agent_access(stdout)
+    result = directory / 'workspace' / 'scheduler.py'
     if result.exists():
         shutil.copyfile(result, directory / 'scheduler.py')
     if timed_out or proc.returncode or accounting['errors']:

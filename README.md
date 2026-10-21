@@ -26,6 +26,11 @@ uv run python -m src.run --mode both --budget-usd 2 \
 
 Results are saved under `runs/`.
 
+`--mode all` adds a third arm, `opencode_noeval`: the same agent with no `./evaluate`, told not
+to run the simulator. Both agent arms work in a temporary directory outside the repository.
+Each attempt's `generation_usage.agent_access` records tool calls that touched evaluation code,
+eudoxia, the workloads or the repository, plus how often the agent ran `./evaluate`.
+
 Simple / Medium / Hard inputs are in `scenarios/`. Select one with
 `--trace scenarios/train/simple.csv`. Validate the inputs with:
 
@@ -38,7 +43,7 @@ uv run python -m scenarios.make_workloads --validate-only
 Run each train trace 5 times (the default), passing run options after `--`:
 
 ```sh
-uv run python -m src.sweep --mode both --repeats 5 -- \
+uv run python -m src.sweep --mode all --repeats 5 -- \
   --budget-usd 2 --budget-guard --budget-slack-usd 0.10 --iterations 1000
 ```
 
