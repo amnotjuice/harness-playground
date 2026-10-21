@@ -3,7 +3,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 EUDOXIA_REV = "c62122cd15eca36d8872f7f9204d2f9c30774b28"
 SCALES = [1, 2, 4, 8, 16]
-TRACE = ROOT / "scenarios/bench_canonical_train.csv"
+TRACE = ROOT / "scenarios/train/hard.csv"
 # Applies to total CPU/RAM allocations; this is rounding tolerance, not overcommit.
 RESOURCE_TOLERANCE = {'rel_tol': 1e-12, 'abs_tol': 1e-9}
 

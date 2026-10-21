@@ -47,12 +47,12 @@
   "limitation": "Hard has more total CPU/I/O work and possible concurrent RAM demand. No work or memory equivalence is claimed. Late arrivals receive less than a full job deadline before the 3600-second horizon, as in the canonical protocol.",
   "sources": {
     "train": {
-      "file": "bench_canonical_train.csv",
+      "file": "train/hard.csv",
       "sha256": "832d4427aa98385a50205ea1c81b387f8ce49e27430772ede4ec1b3febe694f9",
       "url": "https://github.com/BauplanLabs/wiscurds-playground/blob/aeac04a9360e95a2beff3c30af025f307248d05c/summer2026/scenarios/traces/v1/bench_canonical_train.csv"
     },
     "test": {
-      "file": "bench_canonical_test.csv",
+      "file": "test/hard.csv",
       "sha256": "af5e5f27ba0065b78c1f98075afaaee4f9ffdd784dbd7c7ddcc7d0ae8fb269d4",
       "url": "https://github.com/BauplanLabs/wiscurds-playground/blob/aeac04a9360e95a2beff3c30af025f307248d05c/summer2026/scenarios/traces/v1/bench_canonical_test.csv"
     }

@@ -214,7 +214,7 @@ class ExperimentTests(unittest.TestCase):
             trace.write_text('later source edit')
             self.assertEqual(saved.read_text(), 'archived workload')
             self.assertIn('scenarios/custom.csv', manifest['sha256'])
-            self.assertNotIn('scenarios/bench_canonical_train.csv', manifest['sha256'])
+            self.assertNotIn('scenarios/hard.csv', manifest['sha256'])
             args = argparse.Namespace(output=root, trace=saved, iterations=1, prototype=True,
                                       budget_usd=1, timeout=1, agent_timeout=2)
             summary = {'arms': {}}

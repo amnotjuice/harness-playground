@@ -168,13 +168,13 @@ def main():
                                 'a full job deadline before the 3600-second horizon, as in the canonical protocol.',
                   'sources': {}, 'trace_sha256': {}}
         for split in config['seeds']:
-            source = ROOT / 'scenarios' / f'bench_canonical_{split}.csv'
+            source = ROOT / 'scenarios' / split / 'hard.csv'
             require(sha256(source) == SOURCE_HASHES[split], f'Canonical {split} source hash changed')
             traces = build_family(source)
             config['jobs_per_split'][split] = len(traces['medium'])
-            config['sources'][split] = {'file': source.name, 'sha256': sha256(source),
+            config['sources'][split] = {'file': f'{split}/hard.csv', 'sha256': sha256(source),
                 'url': f'https://github.com/BauplanLabs/wiscurds-playground/blob/{REFERENCE_REV}/'
-                       f'summer2026/scenarios/traces/v1/{source.name}'}
+                       f'summer2026/scenarios/traces/v1/bench_canonical_{split}.csv'}
             for condition, rows in traces.items():
                 path = output / split / f'{condition}.csv'
                 path.parent.mkdir(parents=True, exist_ok=True)

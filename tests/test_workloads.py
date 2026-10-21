@@ -16,7 +16,7 @@ from src.config import ROOT, get_canonical_base_params
 class WorkloadTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.full_family = build_family(ROOT / 'scenarios/bench_canonical_train.csv')
+        cls.full_family = build_family(ROOT / 'scenarios/train/hard.csv')
         ids = {row['pipeline_id'] for row in cls.full_family['medium'][:40]}
         cls.family = {name: [row for row in rows if row['pipeline_id'] in ids]
                       for name, rows in cls.full_family.items()}
@@ -31,15 +31,15 @@ class WorkloadTests(unittest.TestCase):
                 writer.writerows(rows)
 
     def test_deterministic_derivation_preserves_every_canonical_job(self):
-        same = build_family(ROOT / 'scenarios/bench_canonical_train.csv')
-        other = build_family(ROOT / 'scenarios/bench_canonical_test.csv')
+        same = build_family(ROOT / 'scenarios/train/hard.csv')
+        other = build_family(ROOT / 'scenarios/test/hard.csv')
         self.assertEqual(self.full_family, same)
         self.assertNotEqual(self.full_family, other)
         self.assertEqual(len(same['medium']), 4110)
         self.assertEqual(len(same['hard']), 28083)
         self.assertGreater(float(same['medium'][-1]['arrival_seconds']), 3590)
         for split in ('train', 'test'):
-            self.assertEqual(sha256(ROOT / 'scenarios' / f'bench_canonical_{split}.csv'), SOURCE_HASHES[split])
+            self.assertEqual(sha256(ROOT / 'scenarios' / split / 'hard.csv'), SOURCE_HASHES[split])
 
     def test_full_cli_reproduction_and_complete_hard_source_identity(self):
         hashes = []
@@ -54,7 +54,7 @@ class WorkloadTests(unittest.TestCase):
                 self.assertEqual(config['jobs_per_split']['train'], 4110)
                 for split in ('train', 'test'):
                     self.assertEqual((root / split / 'hard.csv').read_bytes(),
-                                     (ROOT / 'scenarios' / f'bench_canonical_{split}.csv').read_bytes())
+                                     (ROOT / 'scenarios' / split / 'hard.csv').read_bytes())
                 hashes.append(config['trace_sha256'])
         self.assertEqual(hashes[0], hashes[1])
 
