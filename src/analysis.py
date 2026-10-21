@@ -188,12 +188,84 @@ def plot_analysis(directory, report, *, detail=False):
         plt.close(fig)
 
 
+def sweep_rows(directory):
+    """One row per (cell, arm): the within-budget endpoint relative to that run's seed."""
+    manifest = json.loads((Path(directory) / 'sweep.json').read_text())
+    rows = []
+    for cell in manifest['cells']:
+        run = Path(cell['output'])
+        if not (run / 'results.json').exists():
+            continue
+        summary = json.loads((run / 'results.json').read_text())
+        config = json.loads((run / 'run_config.json').read_text())
+        holdout = json.loads((run / 'holdout.json').read_text()) if (run / 'holdout.json').exists() else None
+        for arm, data in summary['arms'].items():
+            result = summarize_arm(arm, data, config.get('budget_usd_per_arm'))
+            seed = result['points'][0]['score'] if result['points'] else None
+            within = result['best_at_or_below_budget']
+            row = {'condition': run.parent.name, 'repeat': cell['repeat'], 'arm': arm,
+                   'status': summary.get('status'), 'stop_reason': result['stop_reason'],
+                   'attempts': result['attempts'], 'known_cost_usd': result['known_cost_usd'],
+                   'cost_complete': result['cost_complete'], 'seed_score': seed,
+                   'best_within_budget': within['best_score'] if within else None,
+                   'train_ratio': within['best_score'] / seed if within and seed else None,
+                   'test_ratio': None, 'generalization_gap': None}
+            entries = holdout['arms'].get(arm, {}).get('chain', []) if holdout else []
+            match = next((e for e in entries if within and e['path'] == within['best_path']), None)
+            if match:
+                row.update(test_ratio=match['test_ratio'], generalization_gap=match['generalization_gap'])
+            rows.append(row)
+    return rows
+
+
+def write_sweep_analysis(directory):
+    from statistics import median
+    directory = Path(directory)
+    rows = sweep_rows(directory)
+    if rows:
+        with (directory / 'aggregate.csv').open('w', newline='') as output:
+            writer = csv.DictWriter(output, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+    groups = {}
+    for row in rows:
+        groups.setdefault((row['condition'], row['arm']), []).append(row)
+    def spread(values):
+        values = [v for v in values if v is not None]
+        if not values:
+            return 'n/a'
+        return f'{median(values):.3f} [{min(values):.3f}, {max(values):.3f}]'
+    lines = [REPORT_MARKER, '# Sweep comparison', '',
+             'Scores are the best confirmed within budget divided by that run\'s seed score '
+             '(lower is better). Cells show median [min, max] over repeats; n counts repeats '
+             'with a confirmed within-budget score.', '',
+             '| Condition | Arm | Runs | n | Train ratio | Test ratio | Gap (test - train) |',
+             '|---|---|---:|---:|---|---|---|']
+    for (condition, arm), group in sorted(groups.items()):
+        confirmed = sum(r['train_ratio'] is not None for r in group)
+        lines.append(f"| {condition} | {arm} | {len(group)} | {confirmed} | "
+                     f"{spread(r['train_ratio'] for r in group)} | {spread(r['test_ratio'] for r in group)} | "
+                     f"{spread(r['generalization_gap'] for r in group)} |")
+    lines += ['', 'Test ratios appear after `python -m src.holdout` scores each run. '
+              'A positive gap means the policy improved less on held-out jobs than on the search trace. '
+              'Per-run detail: [aggregate.csv](aggregate.csv); each run keeps its own report.md.', '']
+    report_path = directory / 'report.md'
+    if not report_path.exists() or report_path.read_text().startswith(REPORT_MARKER):
+        report_path.write_text('\n'.join(lines))
+    return rows
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('directory', type=Path)
+    parser.add_argument('--sweep', action='store_true', help='aggregate a sweep directory containing sweep.json')
     parser.add_argument('--plot', action='store_true', help='compatibility flag; plots are always generated')
     parser.add_argument('--detail', action='store_true', help='also draw a cost plot zoomed after the seed')
     args = parser.parse_args()
+    if args.sweep:
+        write_sweep_analysis(args.directory)
+        print(args.directory / 'report.md')
+        return
     summary = json.loads((args.directory / 'results.json').read_text())
     report = write_analysis(args.directory, summary)
     plot_analysis(args.directory, report, detail=args.detail)

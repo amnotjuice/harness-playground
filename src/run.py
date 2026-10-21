@@ -224,6 +224,15 @@ def run_arm(arm, args, summary, save, *, generator=None, selector='best'):
     save()
 
 
+def snapshot_trace_name(trace):
+    """Keep the split folder so train/hard.csv and test/hard.csv stay distinct."""
+    try:
+        relative = Path(trace).resolve().relative_to(ROOT / 'scenarios')
+    except ValueError:
+        relative = Path(Path(trace).name)
+    return f'scenarios/{relative.as_posix()}'
+
+
 def snapshot_experiment(output, trace=TRACE):
     """Explicit allowlist: capture research inputs, never .env or credentials."""
     names = ['src/' + name for name in [
@@ -238,7 +247,7 @@ def snapshot_experiment(output, trace=TRACE):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, target)
         hashes[name] = hashlib.sha256(target.read_bytes()).hexdigest()
-    trace_name = f'scenarios/{trace.name}'
+    trace_name = snapshot_trace_name(trace)
     target = output / 'snapshot' / trace_name
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(trace, target)
@@ -330,10 +339,11 @@ def main():
                           for name, g, _ in conditions},
                'simulation_params': get_canonical_base_params(args.prototype),
                'scales': SCALES, 'trace': args.trace.name, 'trace_source': str(args.trace),
+               'trace_snapshot': snapshot_trace_name(args.trace),
                'trace_sha256': hashlib.sha256(args.trace.read_bytes()).hexdigest(),
                'resource_tolerance': RESOURCE_TOLERANCE}
     # Evaluate the saved workload so an edit to the source CSV cannot split the arms.
-    args.trace = args.output / 'snapshot' / 'scenarios' / args.trace.name
+    args.trace = args.output / 'snapshot' / snapshot_trace_name(args.trace)
     write_json(args.output / 'run_config.json', run_config)
     summary = {'status': 'running', 'run_config': 'run_config.json', 'arms': {}}
     def save():
