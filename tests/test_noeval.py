@@ -63,6 +63,18 @@ class NoEvalTests(unittest.TestCase):
         mixed = generators.audit_agent_access(tool_event(f'cat {own}/abc/eval.json {ROOT}/src/worker.py'), allowed=[own])
         self.assertEqual(mixed['markers'], sorted(['src/worker', str(ROOT)]))
 
+    def test_opencode_without_dir_or_variant_is_refused_with_its_version(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cli = Path(temp) / 'opencode'
+            # OpenCode 2.x: --model and --format remain, --dir and --variant are gone.
+            cli.write_text('#!/bin/sh\n[ "$1" = --version ] && echo "opencode v2.1.2" && exit 0\n'
+                           'echo "--model --format --auto"\n')
+            cli.chmod(0o755)
+            with patch.object(generators, 'ROOT', Path(temp).parent), \
+                 patch('shutil.which', return_value=str(cli)):
+                with self.assertRaisesRegex(RuntimeError, r'opencode v2\.1\.2.*1\.19'):
+                    generators.detect_opencode()
+
     def test_cached_agent_input_is_recorded_separately(self):
         step = json.dumps({'type': 'step_finish', 'part': {'id': 'a', 'cost': .1, 'tokens': {
             'input': 3, 'output': 29, 'reasoning': 0, 'cache': {'write': 8337, 'read': 120}}}})

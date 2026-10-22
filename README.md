@@ -1,6 +1,12 @@
 # Setup
 
-Requires Python 3.12+, [uv](https://docs.astral.sh/uv/), and [OpenCode](https://opencode.ai/).
+Requires Python 3.12+, [uv](https://docs.astral.sh/uv/), and [OpenCode](https://opencode.ai/) 1.x
+(validated with 1.19.3; 2.x removed `run --dir` and `--variant`). The harness uses `.tools/opencode`
+if present, else `opencode` on `PATH`; with several installs, pin one:
+
+```sh
+printf '#!/bin/sh\nexec /path/to/opencode-1.x "$@"\n' > .tools/opencode && chmod +x .tools/opencode
+```
 
 ```sh
 uv sync --locked

@@ -261,9 +261,21 @@ def detect_opencode():
         raise RuntimeError('opencode is not installed/on PATH; install it manually, then run opencode run --help')
     help_result = subprocess.run([executable, 'run', '--help'], capture_output=True, text=True, timeout=20, env=opencode_environment())
     help_text = help_result.stdout + help_result.stderr
-    if help_result.returncode or any(flag not in help_text for flag in ('--model', '--format', '--dir')):
-        raise RuntimeError('Installed opencode must support run --model, --format json and --dir')
+    if help_result.returncode or any(flag not in help_text for flag in ('--model', '--format', '--dir', '--variant')):
+        # OpenCode 2.x dropped --dir and --variant; pin a 1.x binary at .tools/opencode.
+        raise RuntimeError(f'{executable} ({opencode_version(executable)}) must support run --model, --format json, '
+                           f'--dir and --variant; validated with OpenCode 1.19.x. Point .tools/opencode at a 1.x binary.')
     return executable, help_text
+
+
+def opencode_version(executable):
+    try:
+        result = subprocess.run([executable, '--version'], capture_output=True, text=True, timeout=20,
+                                env=opencode_environment())
+        return (result.stdout or result.stderr).strip() or 'unknown version'
+    except (OSError, subprocess.TimeoutExpired):
+        return 'unknown version'
+
 
 
 def parse_opencode_usage(stdout):

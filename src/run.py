@@ -13,7 +13,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from .config import ROOT, EUDOXIA_REV, SCALES, TRACE, RESOURCE_TOLERANCE, default_agent_timeout, get_canonical_base_params
 from .evaluator import evaluate_scheduler
-from .generators import build_prompt, detect_opencode, generate_direct, generate_opencode, validate_code, write_json
+from .generators import build_prompt, detect_opencode, opencode_version, generate_direct, generate_opencode, validate_code, write_json
 from .selection import SELECTOR_MAX_TOKENS, select_parent
 
 
@@ -304,6 +304,7 @@ def main():
         args.output = ROOT / 'runs' / f'experiment-{stamp}'
     args.output = args.output.resolve()
     generators = MODES[args.mode]
+    opencode_path = None
     selectors = ['best', 'llm'] if args.selector == 'compare' else [args.selector]
     conditions = [(f'{g}_{s}' if args.selector == 'compare' else g, g, s)
                   for g in generators for s in selectors]
@@ -317,7 +318,7 @@ def main():
                 parser.error(f'Fill OPENAI_API_KEY in {ROOT / ".env"} before running')
             if arm.startswith('opencode'):
                 try:
-                    detect_opencode()
+                    opencode_path = detect_opencode()[0]
                 except (RuntimeError, OSError, TimeoutError) as exc:
                     parser.error(str(exc))
     if (args.output / 'run_config.json').exists() or (args.output / 'results.json').exists() or any(
@@ -341,6 +342,8 @@ def main():
                'direct_timeout_seconds': args.timeout, 'agent_timeout_seconds': args.agent_timeout,
                'direct_reasoning_effort': os.getenv('DIRECT_REASONING_EFFORT') or None,
                'opencode_variant': os.getenv('OPENCODE_VARIANT') or None,
+               'opencode': ({'path': opencode_path, 'version': opencode_version(opencode_path)}
+                            if opencode_path else None),
                'models': {name: os.getenv('DIRECT_MODEL' if g == 'direct' else 'OPENCODE_MODEL', '')
                           for name, g, _ in conditions},
                'simulation_params': get_canonical_base_params(args.prototype),
