@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from .config import ROOT, TRACE, default_agent_timeout
@@ -162,6 +163,17 @@ def write_evaluation_launcher(work, output_dir=None, *, prototype=False, trace=T
     return launcher
 
 
+# Waits before each retry of a transient provider failure (connection drops, 5xx,
+# rate limits). Long runs meet these routinely; anything else stays fatal.
+PROVIDER_RETRY_DELAYS = (10, 30, 90)
+
+
+def transient_provider_errors():
+    import litellm
+    return (litellm.APIConnectionError, litellm.InternalServerError, litellm.ServiceUnavailableError,
+            litellm.BadGatewayError, litellm.RateLimitError)
+
+
 def configured_model_prices(model):
     """Per-million-token prices for an openai/ model listed in opencode.json, else None."""
     if not model.startswith('openai/'):
@@ -207,12 +219,24 @@ def call_llm(directory, prompt, model, timeout, accounting, *, reasoning_effort=
     if max_tokens is not None:
         kwargs['max_completion_tokens'] = max_tokens
     accounting['model_invocations'] = 1  # attempted; provider failure can leave usage unknown
-    try:
-        response = litellm.completion(**kwargs)
-    except litellm.Timeout as exc:
-        raise TimeoutError('Model call timed out') from exc
-    except Exception as exc:
-        raise RuntimeError(f'Provider call failed ({type(exc).__name__}): {exc}') from exc
+    retries = accounting.setdefault('provider_retries', [])
+    while True:
+        try:
+            response = litellm.completion(**kwargs)
+            break
+        except litellm.Timeout as exc:  # a subclass of APIConnectionError: a deadline, not a drop
+            raise TimeoutError('Model call timed out') from exc
+        except transient_provider_errors() as exc:
+            if len(retries) == len(PROVIDER_RETRY_DELAYS):
+                raise RuntimeError(f'Provider call failed after {len(retries)} retries '
+                                   f'({type(exc).__name__}): {exc}') from exc
+            # A failed request may still have been billed; the retry is recorded so it stays visible.
+            delay = PROVIDER_RETRY_DELAYS[len(retries)]
+            retries.append({'error': f'{type(exc).__name__}: {str(exc)[:300]}', 'wait_seconds': delay})
+            accounting['model_invocations'] += 1
+            time.sleep(delay)
+        except Exception as exc:
+            raise RuntimeError(f'Provider call failed ({type(exc).__name__}): {exc}') from exc
     write_json(directory / 'response.json', response.model_dump(mode='json'))
     raw = response.choices[0].message.content or ''
     (directory / 'response.txt').write_text(raw)

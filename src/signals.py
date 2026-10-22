@@ -79,6 +79,7 @@ def agent_features(row, directory):
             'agent_model_invocations': usage.get('model_invocations'),
             'agent_cost_usd': usage.get('observed_cost_usd'),
             'agent_repo_access': bool(access.get('markers')),
+            'agent_provider_retries': len(usage.get('provider_retries') or []),
             'agent_self_tests': len(tests), 'agent_self_tests_valid': len(scores),
             'agent_first_test_score': scores[0] if scores else None,
             'agent_best_test_score': min(scores) if scores else None,

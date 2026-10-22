@@ -583,6 +583,34 @@ class ExperimentTests(unittest.TestCase):
                 self.assertEqual(usage['model_invocations'], 1)
                 self.assertIsNone(usage['estimated_cost_usd'])
 
+    def test_transient_provider_errors_are_retried_and_recorded(self):
+        import litellm
+        from types import SimpleNamespace
+        response = SimpleNamespace(model_dump=lambda **kw: {}, service_tier='default',
+            choices=[SimpleNamespace(message=SimpleNamespace(content='candidate'))],
+            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5))
+        dropped = litellm.InternalServerError(message='Connection error.', model='fake', llm_provider='openai')
+        limited = litellm.RateLimitError(message='slow down', model='fake', llm_provider='openai')
+        with tempfile.TemporaryDirectory() as temp, \
+             patch('litellm.completion', side_effect=[dropped, limited, response]) as call, \
+             patch('litellm.completion_cost', return_value=.01), \
+             patch.object(generators.time, 'sleep') as sleep:
+            usage = {}
+            self.assertEqual(generators.call_llm(Path(temp), 'prompt', 'fake', 1, usage), 'candidate')
+        self.assertEqual(call.call_count, 3)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [10, 30])
+        self.assertEqual(usage['model_invocations'], 3)
+        self.assertEqual([r['error'].split(':')[0] for r in usage['provider_retries']],
+                         ['InternalServerError', 'RateLimitError'])
+        self.assertEqual(usage['estimated_cost_usd'], .01)
+        # A provider that keeps failing still stops after the last retry.
+        with tempfile.TemporaryDirectory() as temp, \
+             patch('litellm.completion', side_effect=dropped) as call, \
+             patch.object(generators.time, 'sleep'):
+            with self.assertRaisesRegex(RuntimeError, 'after 3 retries'):
+                generators.call_llm(Path(temp), 'prompt', 'fake', 1, {})
+        self.assertEqual(call.call_count, 4)
+
     def test_agent_timeout_allows_full_evaluations_and_is_shown_in_prompt(self):
         from src.config import default_agent_timeout
         self.assertEqual(default_agent_timeout(), 2100)
