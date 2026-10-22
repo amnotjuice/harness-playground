@@ -57,6 +57,18 @@ class NoEvalTests(unittest.TestCase):
         self.assertEqual(audit['markers'], sorted(['scenarios/', str(ROOT)]))
         self.assertEqual(len(audit['tool_calls']), 1)
         self.assertEqual(generators.audit_agent_access(tool_event('ls'))['markers'], [])
+        own = ROOT / 'runs/x/candidates/opencode/001/internal_evals'
+        allowed = generators.audit_agent_access(tool_event(f'cat {own}/abc/eval.json'), allowed=[own])
+        self.assertEqual(allowed['markers'], [])
+        mixed = generators.audit_agent_access(tool_event(f'cat {own}/abc/eval.json {ROOT}/src/worker.py'), allowed=[own])
+        self.assertEqual(mixed['markers'], sorted(['src/worker', str(ROOT)]))
+
+    def test_cached_agent_input_is_recorded_separately(self):
+        step = json.dumps({'type': 'step_finish', 'part': {'id': 'a', 'cost': .1, 'tokens': {
+            'input': 3, 'output': 29, 'reasoning': 0, 'cache': {'write': 8337, 'read': 120}}}})
+        usage = generators.parse_opencode_usage(step)
+        self.assertEqual((usage['input_tokens'], usage['cache_read_tokens'], usage['cache_write_tokens']),
+                         (3, 120, 8337))
 
     def test_modes_select_arms_and_noeval_arm_runs_without_self_evaluation(self):
         self.assertEqual(run.MODES['all'], ['direct', 'opencode', 'opencode_noeval'])

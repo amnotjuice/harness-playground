@@ -279,8 +279,9 @@ def parse_opencode_usage(stdout):
         if event.get('type') == 'step_finish':
             part = event.get('part', {})
             steps[part.get('id', str(len(steps)))] = part
-    def total(field):
-        vals = [p.get('tokens', {}).get(field) for p in steps.values()]
+    def total(field, group=None):
+        vals = [(p.get('tokens', {}).get(group) or {}).get(field) if group else p.get('tokens', {}).get(field)
+                for p in steps.values()]
         return sum(vals) if vals and all(isinstance(v, (int, float)) and math.isfinite(v) and v >= 0 for v in vals) else None
     costs = [p.get('cost') for p in steps.values()]
     observed_cost = sum(v for v in costs if isinstance(v, (int, float)) and math.isfinite(v) and v > 0)
@@ -288,6 +289,7 @@ def parse_opencode_usage(stdout):
     cost = observed_cost if costs and all(isinstance(v, (int, float)) and math.isfinite(v) and v > 0 for v in costs) and not errors else None
     return {'input_tokens': total('input'), 'output_tokens': total('output'),
             'reasoning_tokens': total('reasoning'),
+            'cache_read_tokens': total('read', 'cache'), 'cache_write_tokens': total('write', 'cache'),
             'estimated_cost_usd': cost, 'observed_cost_usd': observed_cost,
             'model_invocations': len(steps) or None,
             'usage_note': 'Observed step_finish events; hidden retries/subagents may be unreported.',
@@ -300,8 +302,12 @@ def parse_opencode_usage(stdout):
 ACCESS_MARKERS = ('src.evaluator', 'src/evaluator', 'src.worker', 'src/worker', 'eudoxia', 'scenarios/')
 
 
-def audit_agent_access(stdout, root=ROOT):
-    """Record tool calls that touch evaluation or the repository; never blocks the run."""
+def audit_agent_access(stdout, root=ROOT, allowed=()):
+    """Record tool calls that touch evaluation or the repository; never blocks the run.
+
+    Paths under `allowed` (the agent's own self-test results, which ./evaluate prints)
+    are expected and do not count as access.
+    """
     markers = ACCESS_MARKERS + (str(root),)
     hits = []
     self_eval_calls = 0
@@ -324,6 +330,8 @@ def audit_agent_access(stdout, root=ROOT):
             continue
         for text in inputs(event.get('part', event)):
             self_eval_calls += './evaluate' in text
+            for path in allowed:
+                text = text.replace(str(path), '')
             found = sorted(m for m in markers if m in text)
             if found:
                 hits.append({'markers': found, 'input': text[:300]})
@@ -369,7 +377,7 @@ def generate_opencode(directory, prompt, model, timeout, accounting, *, prototyp
         shutil.rmtree(work, ignore_errors=True)
     stdout = (directory / 'response.txt').read_text()
     accounting.update(parse_opencode_usage(stdout))
-    accounting['agent_access'] = audit_agent_access(stdout)
+    accounting['agent_access'] = audit_agent_access(stdout, allowed=[(directory / 'internal_evals').resolve()])
     result = directory / 'workspace' / 'scheduler.py'
     if result.exists():
         shutil.copyfile(result, directory / 'scheduler.py')

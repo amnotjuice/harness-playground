@@ -74,6 +74,8 @@ def agent_features(row, directory):
     scores = [t['score'] for t in tests if t.get('ok') and t.get('score') is not None]
     return {'agent_input_tokens': usage.get('input_tokens'), 'agent_output_tokens': usage.get('output_tokens'),
             'agent_reasoning_tokens': usage.get('reasoning_tokens'),
+            'agent_cache_read_tokens': usage.get('cache_read_tokens'),
+            'agent_cache_write_tokens': usage.get('cache_write_tokens'),
             'agent_model_invocations': usage.get('model_invocations'),
             'agent_cost_usd': usage.get('observed_cost_usd'),
             'agent_repo_access': bool(access.get('markers')),
