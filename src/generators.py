@@ -231,8 +231,10 @@ def generate_direct(directory, prompt, model, timeout, accounting):
 
 def opencode_environment():
     env = os.environ.copy()
+    # A parallel sweep gives each concurrent slot its own state directory.
+    state = Path(os.environ.get('HARNESS_OPENCODE_STATE') or ROOT / '.tools/state')
     for kind in ('DATA', 'CONFIG', 'CACHE', 'STATE'):
-        env[f'XDG_{kind}_HOME'] = str(ROOT / '.tools/state' / kind.lower())
+        env[f'XDG_{kind}_HOME'] = str(state / kind.lower())
     env['OPENCODE_CONFIG'] = str(ROOT / 'src/opencode.json')
     return env
 

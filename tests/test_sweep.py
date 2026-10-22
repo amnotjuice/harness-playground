@@ -102,6 +102,34 @@ class SweepTests(unittest.TestCase):
             saved = json.loads((output / 'sweep.json').read_text())
             self.assertEqual(saved['repeats'], 2)
 
+    def test_parallel_cells_use_separate_state_slots_and_logs(self):
+        import threading
+        import time
+        from src.generators import opencode_environment
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / 'sweep'
+            active, peak, states = [0], [0], []
+            lock = threading.Lock()
+            def runner(command, cwd, env, stdout, stderr):
+                with lock:
+                    active[0] += 1
+                    peak[0] = max(peak[0], active[0])
+                    states.append(env['HARNESS_OPENCODE_STATE'])
+                stdout.write('run output\n')
+                time.sleep(.05)
+                with lock:
+                    active[0] -= 1
+                return SimpleNamespace(returncode=0)
+            manifest = sweep.run_sweep(output, [ROOT / 'scenarios/train/simple.csv'], 4, 'all', [],
+                                       jobs=2, runner=runner)
+            self.assertEqual(peak[0], 2)
+            self.assertEqual(set(states), {str(ROOT / '.tools/state/job0'), str(ROOT / '.tools/state/job1')})
+            self.assertEqual((output / 'train-simple/rep3/sweep.log').read_text(), 'run output\n')
+            self.assertEqual(len(manifest['cells']), 4)
+            self.assertTrue(all('exit_code' in c for c in manifest['cells']))
+            with patch.dict('os.environ', {'HARNESS_OPENCODE_STATE': states[0]}):
+                self.assertEqual(opencode_environment()['XDG_DATA_HOME'], states[0] + '/data')
+
     def test_cli_rejects_per_cell_flags_after_separator(self):
         with self.assertRaises(SystemExit), patch('sys.stderr'):
             sweep.main(['--repeats', '1', '--', '--trace', 'x.csv'])

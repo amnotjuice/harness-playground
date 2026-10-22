@@ -48,7 +48,9 @@ uv run python -m src.sweep --mode all --repeats 5 -- \
 ```
 
 Each run gets its own directory, `runs/sweep-<time>/<split>-<level>/rep<k>/`. Re-running
-with the same `--output` skips runs that already have results.
+with the same `--output` skips runs that already have results. `--jobs N` runs N at once; each
+run's console output then goes to `sweep.log` in its directory. Keep N within your API rate
+limits and CPU cores.
 
 Score each run's best-so-far schedulers on the matching held-out test trace (no model calls),
 then rebuild the sweep report:
