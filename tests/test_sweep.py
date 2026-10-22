@@ -153,7 +153,7 @@ class SweepTests(unittest.TestCase):
             self.assertAlmostEqual(rows[0]['generalization_gap'], .2)
             self.assertIsNone(rows[1]['test_ratio'])
             report = (output / 'report.md').read_text()
-            self.assertIn('| train-hard | direct | 4 | 4 | 0.700 [0.500, 1.000] | 0.700 [0.700, 0.700] |', report)
+            self.assertIn('| train-hard | direct | 4 | 4 | 1–1 | 0.700 [0.500, 1.000] | 0.700 [0.700, 0.700] |', report)
             self.assertTrue((output / 'aggregate.csv').exists())
 
 

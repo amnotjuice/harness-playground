@@ -93,6 +93,16 @@ class ExperimentTests(unittest.TestCase):
             self.assertEqual(register.call_args.args[0]['gpt-6.1-sol']['input_cost_per_token'], 7e-6)
             self.assertEqual(usage['estimated_cost_usd'], .01)
 
+    def test_every_configured_model_is_priced_from_opencode_configuration(self):
+        luna = generators.configured_model_prices('openai/gpt-6-luna')
+        self.assertEqual((luna['input'], luna['output'], luna['cache_read'], luna['cache_write']),
+                         (0.1, 0.5, 0.01, 0.125))
+        self.assertIsNotNone(generators.configured_model_prices('openai/gpt-6.1-sol'))
+        self.assertIsNone(generators.configured_model_prices('openai/not-configured'))
+        self.assertIsNone(generators.configured_model_prices('anthropic/gpt-6-luna'))
+        config = json.loads((ROOT / 'src/opencode.json').read_text())
+        self.assertIn('medium', config['provider']['openai']['models']['gpt-6-luna']['variants'])
+
     def test_resume_keeps_pool_cost_and_existing_artifacts_and_allows_small_overshoot(self):
         with tempfile.TemporaryDirectory() as temp:
             args = argparse.Namespace(output=Path(temp), trace=TRACE, iterations=20,

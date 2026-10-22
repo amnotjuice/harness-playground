@@ -162,26 +162,41 @@ def write_evaluation_launcher(work, output_dir=None, *, prototype=False, trace=T
     return launcher
 
 
+def configured_model_prices(model):
+    """Per-million-token prices for an openai/ model listed in opencode.json, else None."""
+    if not model.startswith('openai/'):
+        return None
+    try:
+        models = json.loads((ROOT / 'src/opencode.json').read_text())['provider']['openai']['models']
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError(f'Invalid opencode.json: {exc}') from exc
+    if model.split('/', 1)[1] not in models:
+        return None
+    try:
+        prices = models[model.split('/', 1)[1]]['cost']
+        if any(not math.isfinite(prices[key]) or prices[key] < 0
+               for key in ('input', 'output', 'cache_read', 'cache_write')):
+            raise ValueError('Prices must be finite and nonnegative')
+    except (ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError(f'Invalid model pricing in opencode.json: {exc}') from exc
+    return prices
+
+
 def call_llm(directory, prompt, model, timeout, accounting, *, reasoning_effort=None, max_tokens=None):
     """One paid call; save the exact prompt, response and usage before parsing."""
     import litellm
-    # Official standard short-context rates checked 2026-10-08. Older LiteLLM
-    # catalogs lack this new model. Long-context/other-tier pricing stays unknown.
-    if model == 'openai/gpt-6.1-sol':
-        try:
-            prices = json.loads((ROOT / 'src/opencode.json').read_text())['provider']['openai']['models']['gpt-6.1-sol']['cost']
-            if any(not math.isfinite(prices[key]) or prices[key] < 0
-                   for key in ('input', 'output', 'cache_read', 'cache_write')):
-                raise ValueError('Prices must be finite and nonnegative')
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            raise RuntimeError(f'Invalid model pricing in opencode.json: {exc}') from exc
-        # OpenCode uses dollars per million tokens; LiteLLM uses dollars per token.
-        litellm.register_model({'gpt-6.1-sol': {
+    # Models configured in opencode.json are priced from there, so both arms share one
+    # source of official standard short-context rates; older LiteLLM catalogs may lack
+    # them. Long-context and other-tier pricing for these models stays unknown.
+    configured = configured_model_prices(model)
+    if configured:
+        litellm.register_model({model.split('/', 1)[1]: {
             'litellm_provider': 'openai', 'mode': 'chat',
-            'input_cost_per_token': prices['input'] / 1e6,
-            'output_cost_per_token': prices['output'] / 1e6,
-            'cache_read_input_token_cost': prices['cache_read'] / 1e6,
-            'cache_creation_input_token_cost': prices['cache_write'] / 1e6}})
+            # OpenCode uses dollars per million tokens; LiteLLM uses dollars per token.
+            'input_cost_per_token': configured['input'] / 1e6,
+            'output_cost_per_token': configured['output'] / 1e6,
+            'cache_read_input_token_cost': configured['cache_read'] / 1e6,
+            'cache_creation_input_token_cost': configured['cache_write'] / 1e6}})
     (directory / 'prompt.txt').write_text(prompt)
     kwargs = {'model': model, 'messages': [{'role': 'user', 'content': prompt}],
               'num_retries': 0, 'timeout': timeout}
@@ -204,7 +219,7 @@ def call_llm(directory, prompt, model, timeout, accounting, *, reasoning_effort=
     usage = response.usage
     accounting.update(input_tokens=getattr(usage, 'prompt_tokens', None),
                       output_tokens=getattr(usage, 'completion_tokens', None))
-    if model == 'openai/gpt-6.1-sol' and (
+    if configured and (
         (accounting['input_tokens'] or 0) > 272000
         or getattr(response, 'service_tier', None) not in (None, 'default', 'standard')
     ):

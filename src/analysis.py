@@ -242,14 +242,17 @@ def write_sweep_analysis(directory):
              'Scores are the best confirmed within budget divided by that run\'s seed score '
              '(lower is better). Cells show median [min, max] over repeats; n counts repeats '
              'with a confirmed within-budget score.', '',
-             '| Condition | Arm | Runs | n | Train ratio | Test ratio | Gap (test - train) |',
-             '|---|---|---:|---:|---|---|---|']
+             '| Condition | Arm | Runs | n | Attempts | Train ratio | Test ratio | Gap (test - train) |',
+             '|---|---|---:|---:|---|---|---|---|']
     for (condition, arm), group in sorted(groups.items()):
         confirmed = sum(r['train_ratio'] is not None for r in group)
+        attempts = sorted(r['attempts'] for r in group)
         lines.append(f"| {condition} | {arm} | {len(group)} | {confirmed} | "
-                     f"{spread(r['train_ratio'] for r in group)} | {spread(r['test_ratio'] for r in group)} | "
+                     f"{attempts[0]}–{attempts[-1]} | {spread(r['train_ratio'] for r in group)} | {spread(r['test_ratio'] for r in group)} | "
                      f"{spread(r['generalization_gap'] for r in group)} |")
-    lines += ['', 'Test ratios appear after `python -m src.holdout` scores each run. '
+    lines += ['', 'Attempts is the range of generated candidates per run; 0 means the arm stopped '
+              'before generating anything (see stop_reason in aggregate.csv), so its ratio is the seed\'s. '
+              'Test ratios appear after `python -m src.holdout` scores each run. '
               'A positive gap means the policy improved less on held-out jobs than on the search trace. '
               'Per-run detail: [aggregate.csv](aggregate.csv); each run keeps its own report.md.', '']
     report_path = directory / 'report.md'
