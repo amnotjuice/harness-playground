@@ -40,10 +40,10 @@ uv run python -m scenarios.make_workloads --validate-only
 
 # Repeated runs
 
-Run each train trace 5 times (the default), passing run options after `--`:
+Run each train trace 3 times (the default), passing run options after `--`:
 
 ```sh
-uv run python -m src.sweep --mode all --repeats 5 -- \
+uv run python -m src.sweep --mode all --repeats 3 -- \
   --budget-usd 2 --budget-guard --budget-slack-usd 0.10 --iterations 1000
 ```
 

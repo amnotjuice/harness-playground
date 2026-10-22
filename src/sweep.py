@@ -95,7 +95,7 @@ def main(argv=None):
                                             'e.g. -- --budget-usd 2 --budget-guard --iterations 1000')
     parser.add_argument('--mode', default='both', help='run.py --mode for every cell')
     parser.add_argument('--traces', type=Path, nargs='+', default=DEFAULT_TRACES)
-    parser.add_argument('--repeats', type=int, default=5)
+    parser.add_argument('--repeats', type=int, default=3)
     parser.add_argument('--jobs', type=int, default=1,
                         help='cells to run at once; mind API rate limits and CPU cores')
     parser.add_argument('--output', type=Path, default=None, help='default: runs/sweep-<timestamp>')
