@@ -96,7 +96,9 @@ def run_arm(arm, args, summary, save, *, generator=None, selector='best'):
         directory = arm_dir / ('000_seed' if iteration == 0 else f'{iteration:03d}')
         directory.mkdir(parents=True)
         parent = best_candidate(pool) if pool else None
-        source = Path(parent['path']) / 'scheduler.py' if parent else ROOT / 'src/seed.py'
+        # Iteration 0 is the starting scheduler: the naive seed unless --start-scheduler names another.
+        start = getattr(args, 'start_scheduler', None) or ROOT / 'src/seed.py'
+        source = Path(parent['path']) / 'scheduler.py' if parent else start
         shutil.copyfile(source, directory / 'scheduler.py')
         generation_usage = {'input_tokens': None, 'output_tokens': None, 'estimated_cost_usd': 0.0,
                  'observed_cost_usd': 0.0, 'model_invocations': 0}
@@ -285,6 +287,8 @@ def main():
     parser.add_argument('--agent-timeout', type=float, default=None,
                         help='OpenCode session seconds; default: --timeout plus two full evaluator timeout budgets')
     parser.add_argument('--output', type=Path, default=None, help='default: a fresh timestamped directory under runs/')
+    parser.add_argument('--start-scheduler', type=Path, default=None,
+                        help='scheduler.py every arm starts from instead of src/seed.py (e.g. an earlier best)')
     args = parser.parse_args()
     if args.selector == 'compare' and len(MODES[args.mode]) > 1:
         parser.error('--selector compare requires one generator: --mode direct, opencode or opencode_noeval')
@@ -325,6 +329,14 @@ def main():
         (args.output / 'candidates' / arm).exists() and any((args.output / 'candidates' / arm).iterdir()) for arm in arms):
         parser.error('Output already contains results. Use --output runs/NEW_NAME for a fresh experiment.')
     validate_code((ROOT / 'src/seed.py').read_text())
+    if args.start_scheduler is not None:
+        args.start_scheduler = args.start_scheduler.resolve()
+        if not args.start_scheduler.is_file():
+            parser.error(f'Start scheduler does not exist: {args.start_scheduler}')
+        try:
+            validate_code(args.start_scheduler.read_text())
+        except (SyntaxError, ValueError) as exc:
+            parser.error(f'Start scheduler is not a valid policy: {exc}')
     args.output.mkdir(parents=True, exist_ok=True)
     run_config = {'schema_version': 3, **snapshot_experiment(args.output, args.trace),
                'mode': args.mode, 'eudoxia_revision': EUDOXIA_REV, 'prototype': args.prototype,
@@ -351,6 +363,15 @@ def main():
                'trace_snapshot': snapshot_trace_name(args.trace),
                'trace_sha256': hashlib.sha256(args.trace.read_bytes()).hexdigest(),
                'resource_tolerance': RESOURCE_TOLERANCE}
+    if args.start_scheduler is not None:
+        # Start from a frozen copy, so a later edit to the source file cannot change this run.
+        saved = args.output / 'snapshot' / 'start_scheduler.py'
+        shutil.copyfile(args.start_scheduler, saved)
+        run_config['start_scheduler'] = {'source': str(args.start_scheduler),
+                                         'sha256': hashlib.sha256(saved.read_bytes()).hexdigest()}
+        args.start_scheduler = saved
+    else:
+        run_config['start_scheduler'] = None
     # Evaluate the saved workload so an edit to the source CSV cannot split the arms.
     args.trace = args.output / 'snapshot' / snapshot_trace_name(args.trace)
     write_json(args.output / 'run_config.json', run_config)

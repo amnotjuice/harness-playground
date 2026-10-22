@@ -67,6 +67,26 @@ uv run python -m src.holdout runs/sweep-<time>/*/rep*
 uv run python -m src.analysis --sweep runs/sweep-<time>
 ```
 
+# Early-signal sessions
+
+Does early self-test progress in an agent session predict the session's final score? Run many
+independent agent + evaluator sessions from one fixed starting scheduler (`--iterations 1` = one
+session per run). `scenarios/start_schedulers/simple_direct_180s.py` is the best direct-call
+scheduler from the shallow sweep (179.9 s on `train/simple.csv`, 0.25x the seed). Each run keeps
+a frozen copy and its checksum.
+
+```sh
+# 3-session pilot, then the main run with --repeats 40 --output runs/sessions-main
+uv run python -m src.sweep --mode opencode --repeats 3 --jobs 3 --traces scenarios/train/simple.csv \
+  --model openai/gpt-6.1-sol --output runs/sessions-pilot -- --iterations 1 --agent-timeout 3600 \
+  --start-scheduler scenarios/start_schedulers/simple_direct_180s.py
+uv run python -m src.early_signal runs/sessions-pilot --k 1 5
+```
+
+`early_signal/` gets `sessions.csv`, `summary.json` and three plots: final score vs best score after
+k self-tests with a least-squares fit and ±1 residual SD band (A), fit quality by checkpoint with
+bootstrap intervals (B), and improvement after k vs best after k (C).
+
 # RQ3 signals and predictions
 
 Build a per-candidate table of predictors (code, parent diagnostics, agent behavior) and
