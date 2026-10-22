@@ -35,14 +35,14 @@ def plan_cells(output, traces, repeats):
             for trace in traces for repeat in range(1, repeats + 1)]
 
 
-def run_sweep(output, traces, repeats, mode, run_args, *, jobs=1, runner=subprocess.run):
+def run_sweep(output, traces, repeats, mode, run_args, *, jobs=1, model=None, runner=subprocess.run):
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     manifest_path = output / 'sweep.json'
     manifest = (json.loads(manifest_path.read_text()) if manifest_path.exists() else
                 {'created_at_utc': datetime.now(timezone.utc).isoformat()})
     cells = plan_cells(output, traces, repeats)
-    manifest.update(mode=mode, repeats=repeats, jobs=jobs, run_args=run_args, cells=cells)
+    manifest.update(mode=mode, model=model, repeats=repeats, jobs=jobs, run_args=run_args, cells=cells)
     write_json(manifest_path, manifest)
     pending = []
     for cell in cells:
@@ -62,15 +62,17 @@ def run_sweep(output, traces, repeats, mode, run_args, *, jobs=1, runner=subproc
         name = Path(cell['output']).relative_to(output)
         command = [sys.executable, '-m', 'src.run', '--mode', mode, '--trace', cell['trace'],
                    '--output', cell['output'], *run_args]
+        # Explicit, so a lost shell variable cannot silently fall back to the .env model.
+        env = dict(os.environ, **({'DIRECT_MODEL': model, 'OPENCODE_MODEL': model} if model else {}))
         slot = slots.get()
         try:
             with lock:
                 print(f'== start {name}' + (f' (slot {slot})' if jobs > 1 else ''), flush=True)
             if jobs == 1:
-                code = runner(command, cwd=ROOT).returncode
+                code = runner(command, cwd=ROOT, env=env).returncode
             else:
                 # Concurrent OpenCode processes must not share one state database.
-                env = dict(os.environ, HARNESS_OPENCODE_STATE=str(ROOT / '.tools/state' / f'job{slot}'))
+                env['HARNESS_OPENCODE_STATE'] = str(ROOT / '.tools/state' / f'job{slot}')
                 Path(cell['output']).mkdir(parents=True, exist_ok=True)
                 with (Path(cell['output']) / 'sweep.log').open('w') as log:
                     code = runner(command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT).returncode
@@ -96,6 +98,9 @@ def main(argv=None):
     parser.add_argument('--mode', default='both', help='run.py --mode for every cell')
     parser.add_argument('--traces', type=Path, nargs='+', default=DEFAULT_TRACES)
     parser.add_argument('--repeats', type=int, default=3)
+    parser.add_argument('--model', default=None,
+                        help='set DIRECT_MODEL and OPENCODE_MODEL for every run, overriding .env '
+                             '(e.g. openai/gpt-6-luna)')
     parser.add_argument('--jobs', type=int, default=1,
                         help='cells to run at once; mind API rate limits and CPU cores')
     parser.add_argument('--output', type=Path, default=None, help='default: runs/sweep-<timestamp>')
@@ -114,7 +119,8 @@ def main(argv=None):
     if args.output is None:
         stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
         args.output = ROOT / 'runs' / f'sweep-{stamp}'
-    manifest = run_sweep(args.output, args.traces, args.repeats, args.mode, run_args, jobs=args.jobs)
+    manifest = run_sweep(args.output, args.traces, args.repeats, args.mode, run_args, jobs=args.jobs,
+                         model=args.model)
     from .analysis import write_sweep_analysis
     write_sweep_analysis(args.output)
     print(f'Sweep: {Path(args.output).resolve() / "report.md"}')

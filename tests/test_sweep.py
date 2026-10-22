@@ -89,10 +89,15 @@ class SweepTests(unittest.TestCase):
             traces = [ROOT / 'scenarios/train/simple.csv', ROOT / 'scenarios/test/simple.csv']
             write_run(output / 'train-simple/rep1', {'direct': [(10, 10, 0)]})
             commands = []
-            def runner(command, cwd):
+            def runner(command, cwd, env):
                 commands.append(command)
+                envs.append(env)
                 return SimpleNamespace(returncode=0)
-            manifest = sweep.run_sweep(output, traces, 2, 'both', ['--budget-usd', '2'], runner=runner)
+            envs = []
+            manifest = sweep.run_sweep(output, traces, 2, 'both', ['--budget-usd', '2'],
+                                       model='openai/gpt-6-luna', runner=runner)
+            self.assertTrue(all(e['DIRECT_MODEL'] == e['OPENCODE_MODEL'] == 'openai/gpt-6-luna' for e in envs))
+            self.assertEqual(manifest['model'], 'openai/gpt-6-luna')
             self.assertEqual(len(commands), 3)
             self.assertNotIn(str(output / 'train-simple/rep1'), [c[c.index('--output') + 1] for c in commands])
             self.assertIn(str(output / 'test-simple/rep2'), [c[c.index('--output') + 1] for c in commands])

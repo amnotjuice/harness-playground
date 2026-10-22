@@ -356,6 +356,7 @@ def main():
         temp = args.output / 'results.json.tmp'
         write_json(temp, summary)
         temp.replace(args.output / 'results.json')
+    print('models: ' + ', '.join(f'{arm}={name or "unset"}' for arm, name in run_config['models'].items()))
     print('arm        iter      score   best_score   elapsed estimated_cost')
     save()
     for arm, generator, selector in conditions:
