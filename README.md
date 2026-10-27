@@ -71,9 +71,14 @@ uv run python -m src.analysis --sweep runs/sweep-<time>
 
 Does early self-test progress in an agent session predict the session's final score? Run many
 independent agent + evaluator sessions from one fixed starting scheduler (`--iterations 1` = one
-session per run). `scenarios/start_schedulers/simple_direct_180s.py` is the best direct-call
-scheduler from the shallow sweep (179.9 s on `train/simple.csv`, 0.25x the seed). Each run keeps
-a frozen copy and its checksum.
+session per run). Starting schedulers in `scenarios/start_schedulers/`, all direct-call results from
+the shallow sweep on `train/simple.csv` (each run keeps a frozen copy and its checksum):
+
+| File | Score | vs seed | One self-test takes |
+| --- | ---: | ---: | ---: |
+| `simple_direct_180s.py` | 179.9 s | 0.25x | ~30 s |
+| `simple_direct_211s.py` | 211.0 s | 0.30x | ~66 s |
+| `simple_direct_221s.py` | 221.4 s | 0.31x | ~210 s |
 
 ```sh
 # 3-session pilot, then the main run with --repeats 40 --output runs/sessions-main
@@ -83,9 +88,10 @@ uv run python -m src.sweep --mode opencode --repeats 3 --jobs 3 --traces scenari
 uv run python -m src.early_signal runs/sessions-pilot --k 1 5
 ```
 
-`early_signal/` gets `sessions.csv`, `summary.json` and three plots: final score vs best score after
-k self-tests with a least-squares fit and ±1 residual SD band (A), fit quality by checkpoint with
-bootstrap intervals (B), and improvement after k vs best after k (C).
+`early_signal/` gets `sessions.csv`, `summary.json` and four plots: final score vs the best score
+among the first k self-tests (not floored at the start) with a least-squares fit and ±1 residual SD
+band (A), fit quality by checkpoint with bootstrap intervals (B), improvement after k (C), and final
+score vs lines of code changed before the first self-test (D).
 
 # RQ3 signals and predictions
 

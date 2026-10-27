@@ -1,17 +1,22 @@
 """Does early self-test progress in an agent session predict the session's final score?
 
 Reads agent + evaluator sessions (one per run, all from the same starting scheduler)
-and, for each session, the best self-test score after k self-tests and the
-session's official final score. Never calls a model.
+and, for each session, two early signals and the session's official final score.
+Never calls a model.
 
 Conventions, fixed before data collection:
   - Scores are the harness score: geometric mean of priority-weighted latency (s).
-  - "Best after k" includes the starting scheduler, so failed or worse early
-    self-tests leave it at the starting score.
+  - Primary signal: "best tested after k" = the best score among the session's
+    first k self-tests, NOT floored at the starting score, so early exploration
+    that tests worse than the start still shows. Self-tests that fail to simulate
+    have no score; a session whose first k self-tests all failed has no value at k.
+  - Second signal: lines of code changed between the starting scheduler and the
+    version the agent first tested (available before any simulation result).
   - A final scheduler that fails evaluation is plotted at the starting score
     (what the search would keep) and marked; a session with no self-tests, or
-    whose generation failed, has no x and is excluded and counted.
-  - A session with fewer than k self-tests is excluded at that k and counted.
+    whose generation failed, has no signal and is excluded and counted.
+  - A session with fewer than k self-tests, or no valid one yet, is excluded at
+    that k and counted.
 """
 import argparse
 import csv
@@ -20,10 +25,12 @@ import math
 import os
 import random
 import sys
+import textwrap
 from pathlib import Path
 
 from .config import ROOT
 from .predict import spearman
+from .signals import code_features
 
 MAX_K = 10
 SESSION_ARM = 'opencode'
@@ -42,18 +49,23 @@ def session_rows(directory):
         arm = json.loads((run / 'results.json').read_text())['arms'].get(SESSION_ARM)
         if not arm or not arm['trajectory'] or arm['trajectory'][0]['score'] is None:
             continue
-        start = arm['trajectory'][0]['score']
         by_path = {r['path']: r for r in arm['trajectory']}
         for r in arm['trajectory'][1:]:
-            tests = [json.loads(p.read_text()) for p in (Path(r['path']) / 'internal_evals').glob('*/eval.json')]
-            tests.sort(key=lambda t: t.get('started_at_utc', ''))
-            scores = [t['score'] if t.get('ok') else None for t in tests]
-            parent = by_path.get(r.get('parent'))
-            parent_score = parent['score'] if parent else start
+            # Each self-test directory holds the exact code tested and its evaluation.
+            tests = [(p.parent, json.loads(p.read_text()))
+                     for p in (Path(r['path']) / 'internal_evals').glob('*/eval.json')]
+            tests.sort(key=lambda t: t[1].get('started_at_utc', ''))
+            scores = [t['score'] if t.get('ok') else None for _, t in tests]
+            parent = by_path.get(r.get('parent')) or arm['trajectory'][0]
+            start_code = (Path(parent['path']) / 'scheduler.py').read_text()
+            first_code = tests[0][0] / 'scheduler.py' if tests else None
             row = {'run': run.name, 'condition': run.parent.name, 'iteration': r['iteration'],
-                   'status': r['status'], 'start_score': parent_score,
+                   'status': r['status'], 'start_score': parent['score'],
                    'self_tests': len(scores), 'valid_self_tests': sum(s is not None for s in scores),
-                   'final_score': r['score'] if r['score'] is not None else parent_score,
+                   'lines_changed_before_first_test': (code_features(first_code.read_text(), start_code)
+                                                       ['code_diff_lines']
+                                                       if first_code and first_code.exists() else None),
+                   'final_score': r['score'] if r['score'] is not None else parent['score'],
                    'final_invalid': r['score'] is None,
                    'excluded': None, 'cost_usd': r.get('observed_cost_usd'),
                    'minutes': r['elapsed_seconds'] / 60}
@@ -61,11 +73,11 @@ def session_rows(directory):
                 row['excluded'] = 'generation failed'
             elif not scores:
                 row['excluded'] = 'no self-tests'
-            best = parent_score
+            best = None
             for k in range(1, MAX_K + 1):
                 if k <= len(scores) and scores[k - 1] is not None:
-                    best = min(best, scores[k - 1])
-                row[f'best_after_{k}'] = best if k <= len(scores) and not row['excluded'] else None
+                    best = scores[k - 1] if best is None else min(best, scores[k - 1])
+                row[f'best_tested_after_{k}'] = best if k <= len(scores) and not row['excluded'] else None
             rows.append(row)
     return rows
 
@@ -104,16 +116,26 @@ def bootstrap(xs, ys, key, draws=2000, seed=0):
     return values[int(.025 * len(values))], values[int(.975 * len(values)) - 1]
 
 
-def points(rows, k, outcome='final'):
-    """(x, y, final_invalid) for sessions that reached k self-tests."""
+def points(rows, signal, outcome='final'):
+    """(x, y, final_invalid) for usable sessions with a value for `signal` (a column name)."""
     out = []
     for r in rows:
-        x = r[f'best_after_{k}']
-        if x is None:
+        x = r[signal]
+        if r['excluded'] or x is None:
             continue
         y = r['final_score'] if outcome == 'final' else r['final_score'] / x
         out.append((x, y, r['final_invalid']))
     return out
+
+
+def fit_entry(pts):
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    entry = {'n': len(pts)}
+    result = fit(xs, ys)
+    if result:
+        entry.update({key: result[key] for key in ('slope', 'intercept', 'r2', 'residual_sd', 'spearman')},
+                     r2_ci=bootstrap(xs, ys, 'r2'), residual_sd_ci=bootstrap(xs, ys, 'residual_sd'))
+    return entry
 
 
 def summarize(rows):
@@ -121,15 +143,12 @@ def summarize(rows):
     summary = {'sessions': len(rows), 'usable': len(usable),
                'excluded': {reason: sum(r['excluded'] == reason for r in rows)
                             for reason in {r['excluded'] for r in rows if r['excluded']}},
-               'final_invalid': sum(r['final_invalid'] for r in usable), 'by_k': {}}
+               'final_invalid': sum(r['final_invalid'] for r in usable), 'by_k': {},
+               'lines_changed_before_first_test': fit_entry(points(rows, 'lines_changed_before_first_test'))}
     for k in range(1, MAX_K + 1):
-        pts = points(rows, k)
-        result = fit([p[0] for p in pts], [p[1] for p in pts])
-        entry = {'n': len(pts), 'short_sessions': len(usable) - len(pts)}
-        if result:
-            xs, ys = [p[0] for p in pts], [p[1] for p in pts]
-            entry.update({key: result[key] for key in ('slope', 'intercept', 'r2', 'residual_sd', 'spearman')},
-                         r2_ci=bootstrap(xs, ys, 'r2'), residual_sd_ci=bootstrap(xs, ys, 'residual_sd'))
+        entry = fit_entry(points(rows, f'best_tested_after_{k}'))
+        entry['fewer_than_k_tests'] = sum(r['self_tests'] < k for r in usable)
+        entry['no_valid_test_yet'] = sum(r['self_tests'] >= k and r[f'best_tested_after_{k}'] is None for r in usable)
         summary['by_k'][k] = entry
     return summary
 
@@ -150,55 +169,76 @@ def plot(rows, summary, out, ks=(1, 5)):
     excluded = ', '.join(f'{count} {reason}' for reason, count in summary['excluded'].items()) or 'none'
     footnote = (f"{summary['usable']} of {summary['sessions']} sessions usable (excluded: {excluded}). "
                 f"Final scheduler failed evaluation in {summary['final_invalid']}: plotted at the starting score, "
-                f"hollow. Sessions with fewer than k self-tests are left out of that panel.")
+                f"hollow.")
 
-    def scatter_panels(name, outcome, ylabel, title):
-        fig, axes = plt.subplots(1, len(ks), figsize=(5.2 * len(ks), 4.6), squeeze=False)
-        for ax, k in zip(axes[0], ks):
-            pts = points(rows, k, outcome)
-            xs, ys = [p[0] for p in pts], [p[1] for p in pts]
-            result = fit(xs, ys)
-            if result:
-                lo, hi = min(xs), max(xs)
-                line = [result['intercept'] + result['slope'] * x for x in (lo, hi)]
-                sd = result['residual_sd']
-                ax.fill_between([lo, hi], [v - sd for v in line], [v + sd for v in line], color=band,
-                                zorder=1, label='±1 residual SD')
-                ax.plot([lo, hi], line, color=ink, linewidth=1.5, zorder=2, label='Least-squares fit')
-                spread = f'{sd:.1f} s' if outcome == 'final' else f'{sd:.3f}'
-                rho = f" · ρ = {result['spearman']:.2f}" if result['spearman'] is not None else ''
-                stats = f"n = {result['n']} · R² = {result['r2']:.2f} · residual SD = {spread}{rho}"
-            else:
-                stats = ''
-                reason = (f'All {len(pts)} sessions have the same x value:\nno spread to fit' if len(set(xs)) == 1
-                          else f'Not enough sessions with ≥ {k} self-tests\n(n = {len(pts)})')
-                ax.text(.5, .5, reason,
-                        transform=ax.transAxes, ha='center', va='center', color=ink2)
-            for x, y, invalid in pts:
-                ax.plot(x, y, marker='o', linestyle='none', markersize=7, zorder=3,
-                        markerfacecolor=surface if invalid else blue, markeredgecolor=blue,
-                        markeredgewidth=1.5 if invalid else 1)
-            if start and outcome == 'final':
-                ax.axhline(start, color=ink2, linestyle=':', linewidth=1)
-                ax.annotate('starting score', (1, start), xycoords=('axes fraction', 'data'), ha='right',
-                            va='bottom', fontsize=8, color=ink2)
-            ax.set(xlabel=f'Best score after {k} self-test{"s" if k > 1 else ""} (s)', ylabel=ylabel)
-            # Statistics sit in the title so they never cover points.
-            ax.set_title(f'k = {k}' + (f'\n{stats}' if result else ''), fontsize=10)
-            if result:
-                ax.legend(frameon=False, fontsize=8, loc='best')
+    def panel(ax, pts, xlabel, heading, outcome='final', short=''):
+        """One scatter with its least-squares line, ±1 residual SD band and statistics in the title."""
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        result = fit(xs, ys)
+        if result:
+            lo, hi = min(xs), max(xs)
+            line = [result['intercept'] + result['slope'] * x for x in (lo, hi)]
+            sd = result['residual_sd']
+            ax.fill_between([lo, hi], [v - sd for v in line], [v + sd for v in line], color=band,
+                            zorder=1, label='±1 residual SD')
+            ax.plot([lo, hi], line, color=ink, linewidth=1.5, zorder=2, label='Least-squares fit')
+            spread = f'{sd:.1f} s' if outcome == 'final' else f'{sd:.3f}'
+            rho = f" · ρ = {result['spearman']:.2f}" if result['spearman'] is not None else ''
+            heading += f"\nn = {result['n']} · R² = {result['r2']:.2f} · residual SD = {spread}{rho}"
+            ax.legend(frameon=False, fontsize=8, loc='best')
+        else:
+            reason = (f'All {len(pts)} sessions have the same x value:\nno spread to fit'
+                      if pts and len(set(xs)) == 1 else f'Not enough sessions (n = {len(pts)})')
+            ax.text(.5, .5, reason, transform=ax.transAxes, ha='center', va='center', color=ink2)
+        for x, y, invalid in pts:
+            ax.plot(x, y, marker='o', linestyle='none', markersize=7, zorder=3,
+                    markerfacecolor=surface if invalid else blue, markeredgecolor=blue,
+                    markeredgewidth=1.5 if invalid else 1)
+        if start and outcome == 'final':
+            ax.axhline(start, color=ink2, linestyle=':', linewidth=1)
+            ax.annotate('starting score', (1, start), xycoords=('axes fraction', 'data'), ha='right',
+                        va='bottom', fontsize=8, color=ink2)
+        if short:
+            heading += f'\n{short}'
+        ax.set(xlabel=xlabel)
+        # Statistics sit in the title so they never cover points.
+        ax.set_title(heading, fontsize=10)
+
+    def finish(fig, name, title, note):
         fig.suptitle(title, x=.01, ha='left', fontsize=12, fontweight='bold')
-        import textwrap
-        fig.text(.01, .01, textwrap.fill(footnote, int(fig.get_figwidth() * 15)), fontsize=8, color=ink2,
+        fig.text(.01, .01, textwrap.fill(note, int(fig.get_figwidth() * 15)), fontsize=8, color=ink2,
                  ha='left', va='bottom')
         fig.tight_layout(rect=(0, .07, 1, .94))
         fig.savefig(out / name, dpi=200)
         plt.close(fig)
 
-    scatter_panels('A_final_vs_early.png', 'final', 'Final score (s, lower is better)',
-                   'Does the score after k self-tests predict where the session ends?')
-    scatter_panels('C_further_improvement.png', 'further', 'Final ÷ best after k (< 1: kept improving)',
-                   'Does early progress predict further progress after k?')
+    def by_k_figure(name, outcome, ylabel, title):
+        fig, axes = plt.subplots(1, len(ks), figsize=(5.2 * len(ks), 4.8), squeeze=False)
+        for ax, k in zip(axes[0], ks):
+            e = summary['by_k'][k]
+            dropped = (f"left out: {e['fewer_than_k_tests']} with < {k} tests, "
+                       f"{e['no_valid_test_yet']} with no valid test yet")
+            panel(ax, points(rows, f'best_tested_after_{k}', outcome),
+                  f'Best score among the first {k} self-test{"s" if k > 1 else ""} (s)', f'k = {k}',
+                  outcome, dropped)
+            ax.set_ylabel(ylabel)
+        finish(fig, name, title, footnote + ' The best tested score is not floored at the starting score, '
+               'so early tests worse than the start count.')
+
+    by_k_figure('A_final_vs_early.png', 'final', 'Final score (s, lower is better)',
+                'Does the best score in the first k self-tests predict where the session ends?')
+    by_k_figure('C_further_improvement.png', 'further', 'Final ÷ best tested after k (< 1: kept improving)',
+                'Does early progress predict further progress after k?')
+
+    # D: a signal available before any simulation result.
+    fig, ax = plt.subplots(figsize=(6.4, 4.8))
+    panel(ax, points(rows, 'lines_changed_before_first_test'),
+          'Lines changed from the starting scheduler before the first self-test', 'Code changed before first test')
+    ax.set_ylabel('Final score (s, lower is better)')
+    finish(fig, 'D_code_changed_before_first_test.png',
+           'Does the size of the first edit predict where the session ends?',
+           footnote + ' Lines changed = added plus removed lines in a diff of the starting scheduler and the '
+           'code the agent first tested.')
 
     # B: how the fit sharpens with k; one measure per panel.
     fig, axes = plt.subplots(1, 2, figsize=(10.4, 4.2))
@@ -219,13 +259,10 @@ def plot(rows, summary, out, ks=(1, 5)):
             ax.set_ylim(0, 1.05)
     axes[0].set_title('Spread around the fit')
     axes[1].set_title('Variance explained')
-    fig.suptitle('How early is early enough? Prediction quality by checkpoint (bands: 95% bootstrap)',
-                 x=.01, ha='left', fontsize=12, fontweight='bold')
-    fig.text(.01, .01, 'n falls with k because short sessions drop out; later checkpoints are biased toward '
-             'long sessions.', fontsize=8, color=ink2, ha='left', va='bottom')
-    fig.tight_layout(rect=(0, .05, 1, .93))
-    fig.savefig(out / 'B_prediction_by_k.png', dpi=200)
-    plt.close(fig)
+    finish(fig, 'B_prediction_by_k.png',
+           'How early is early enough? Prediction quality by checkpoint (bands: 95% bootstrap)',
+           'Fit of final score on the best score among the first k self-tests. n falls with k because short '
+           'sessions drop out; later checkpoints are biased toward long sessions.')
 
 
 def write_early_signal(directory, ks=(1, 5)):
@@ -249,7 +286,7 @@ def main(argv=None):
     parser.add_argument('directory', type=Path, help='a sweep directory of session runs, or one run')
     parser.add_argument('--k', type=int, nargs='+', default=[1, 5], help='checkpoints for the scatter plots')
     args = parser.parse_args(argv)
-    rows, summary = write_early_signal(args.directory, tuple(args.k))
+    _, summary = write_early_signal(args.directory, tuple(args.k))
     print(json.dumps({key: summary[key] for key in ('sessions', 'usable', 'excluded', 'final_invalid')}))
     print(f'{args.directory / "early_signal"}')
     return 0
