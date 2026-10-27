@@ -170,7 +170,9 @@ def plot(rows, summary, out, ks=(1, 5)):
                 stats = f"n = {result['n']} · R² = {result['r2']:.2f} · residual SD = {spread}{rho}"
             else:
                 stats = ''
-                ax.text(.5, .5, f'Not enough sessions with ≥ {k} self-tests\n(n = {len(pts)})',
+                reason = (f'All {len(pts)} sessions have the same x value:\nno spread to fit' if len(set(xs)) == 1
+                          else f'Not enough sessions with ≥ {k} self-tests\n(n = {len(pts)})')
+                ax.text(.5, .5, reason,
                         transform=ax.transAxes, ha='center', va='center', color=ink2)
             for x, y, invalid in pts:
                 ax.plot(x, y, marker='o', linestyle='none', markersize=7, zorder=3,
@@ -184,7 +186,7 @@ def plot(rows, summary, out, ks=(1, 5)):
             # Statistics sit in the title so they never cover points.
             ax.set_title(f'k = {k}' + (f'\n{stats}' if result else ''), fontsize=10)
             if result:
-                ax.legend(frameon=False, fontsize=8, loc='lower right')
+                ax.legend(frameon=False, fontsize=8, loc='best')
         fig.suptitle(title, x=.01, ha='left', fontsize=12, fontweight='bold')
         import textwrap
         fig.text(.01, .01, textwrap.fill(footnote, int(fig.get_figwidth() * 15)), fontsize=8, color=ink2,
