@@ -619,6 +619,9 @@ class ExperimentTests(unittest.TestCase):
         self.assertIn('2100-second', generators.render_opencode_prompt('task'))
         self.assertIn('1500-second', generators.render_opencode_prompt('task', prototype=True))
         self.assertIn('45-second', generators.render_opencode_prompt('task', timeout=45))
+        # A shell timeout shorter than one full evaluation killed ./evaluate mid-run.
+        self.assertIn('at least\n900 seconds', generators.render_opencode_prompt('task'))
+        self.assertIn('at least\n600 seconds', generators.render_opencode_prompt('task', prototype=True))
 
     def test_prompt_retains_evolved_metric_and_diagnostics_without_archive_metadata(self):
         from copy import deepcopy
@@ -695,7 +698,8 @@ class ExperimentTests(unittest.TestCase):
                 result = subprocess.run([str(launcher)], cwd=temp, capture_output=True, text=True, check=True)
                 actual = json.loads(result.stdout)
                 expected = ['--scheduler', str(work / 'scheduler.py'),
-                            '--output-dir', str(work.parent / 'internal_evals'), '--trace', str(TRACE.resolve())]
+                            '--output-dir', str(work.parent / 'internal_evals'), '--trace', str(TRACE.resolve()),
+                            '--copy-to', str(work / 'evals')]
                 if prototype:
                     expected.append('--prototype')
                 self.assertEqual(actual['args'], expected)
@@ -725,6 +729,29 @@ class ExperimentTests(unittest.TestCase):
             self.assertEqual(seen[0][0].read_text(), 'first candidate')
             self.assertEqual(json.loads((seen[0][0].parent / 'eval.json').read_text())['score'], 7)
             self.assertFalse(json.loads((seen[1][0].parent / 'eval.json').read_text())['ok'])
+
+    def test_self_evaluation_copies_results_into_the_workspace_and_hides_the_archive(self):
+        import contextlib
+        import io
+        from src import evaluator
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            source = directory / 'scheduler.py'
+            archive, workspace_evals = directory / 'internal_evals', directory / 'work' / 'evals'
+            args = ['--scheduler', str(source), '--output-dir', str(archive), '--copy-to', str(workspace_evals)]
+            printed = io.StringIO()
+            with patch.object(evaluator, 'evaluate_scheduler', return_value={'ok': True, 'score': 5}), \
+                 contextlib.redirect_stdout(printed):
+                for text in ('first', 'second'):
+                    source.write_text(text)
+                    evaluator.main(args)
+            self.assertEqual((workspace_evals / '1/scheduler.py').read_text(), 'first')
+            self.assertEqual((workspace_evals / '2/scheduler.py').read_text(), 'second')
+            self.assertEqual(json.loads((workspace_evals / '2/eval.json').read_text())['score'], 5)
+            self.assertEqual(len(list(archive.iterdir())), 2)
+            # Reading a printed path outside the workspace ends an OpenCode run session.
+            self.assertNotIn(str(archive), printed.getvalue())
+            self.assertIn('./evals/2/', printed.getvalue())
 
 
 if __name__ == '__main__':

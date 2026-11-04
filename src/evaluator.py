@@ -63,6 +63,9 @@ def main(argv=None):
     parser.add_argument('--output-dir', type=Path, required=True, help='a fresh subdirectory is created per evaluation')
     parser.add_argument('--prototype', action='store_true')
     parser.add_argument('--trace', type=Path, default=TRACE)
+    parser.add_argument('--copy-to', type=Path,
+                        help="also copy each tested version and result to a numbered subdirectory here (the agent's "
+                             'workspace), so the agent never needs to read outside it')
     args = parser.parse_args(argv)
     if not args.scheduler.is_file():
         parser.error('Scheduler file does not exist')
@@ -76,7 +79,14 @@ def main(argv=None):
     evaluation = evaluate_scheduler(scheduler, prototype=args.prototype, trace=args.trace)
     rendered = json.dumps(evaluation, indent=2, allow_nan=False) + '\n'
     (directory / 'eval.json').write_text(rendered)
-    print(f'Evaluation artifacts: {directory}')
+    if args.copy_to:
+        # OpenCode run ends the session when the agent reads outside its workspace, so the
+        # archive's location is never printed; the archive itself stays the record.
+        args.copy_to.mkdir(parents=True, exist_ok=True)
+        number = 1 + max((int(p.name) for p in args.copy_to.iterdir() if p.name.isdigit()), default=0)
+        copy = args.copy_to / str(number)
+        shutil.copytree(directory, copy)
+        print(f'Saved this version and result to ./{args.copy_to.name}/{number}/ (scheduler.py, eval.json)')
     print(rendered, end='')
     return 0 if evaluation['ok'] else 1
 

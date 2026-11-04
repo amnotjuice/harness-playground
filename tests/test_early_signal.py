@@ -13,7 +13,7 @@ from src.config import ROOT
 START_CODE = (ROOT / 'src/seed.py').read_text()
 
 
-def write_session_run(directory, start, final, tests, status='improved', first_edit_lines=0):
+def write_session_run(directory, start, final, tests, status='improved', first_edit_lines=0, cut_off=False):
     """One run: the starting scheduler (iteration 0) and one agent session with timed self-tests.
 
     `tests` are scores in time order; the first tested code adds `first_edit_lines` lines.
@@ -23,6 +23,8 @@ def write_session_run(directory, start, final, tests, status='improved', first_e
     seed_dir.mkdir(parents=True)
     session_dir.mkdir(parents=True)
     (seed_dir / 'scheduler.py').write_text(START_CODE)
+    if cut_off:
+        (session_dir / 'stderr.txt').write_text('! permission requested: external_directory (/x/*); auto-rejecting\n')
     for k, score in enumerate(tests):
         # Directory names run opposite to time order; the timestamp decides the order.
         test = session_dir / 'internal_evals' / f'{len(tests) - k:02d}'
@@ -66,11 +68,13 @@ class EarlySignalTests(unittest.TestCase):
             write_sweep(root, [(180, 160, [175, 165]),                    # usable
                                (180, None, [None, 170]),                  # final invalid; no valid test at k=1
                                (180, 200, []),                            # no self-tests
-                               (180, None, [], 'generation_failed')])
+                               (180, None, [], 'generation_failed'),
+                               (180, 200, [190], 'improved', {'cut_off': True})])
             rows = early_signal.session_rows(root)
             summary = early_signal.summarize(rows)
             self.assertEqual(summary['usable'], 2)
-            self.assertEqual(summary['excluded'], {'no self-tests': 1, 'generation failed': 1})
+            self.assertEqual(summary['excluded'], {'no self-tests': 1, 'generation failed': 1,
+                                                   'cut off by a rejected permission': 1})
             self.assertEqual(summary['final_invalid'], 1)
             self.assertEqual(rows[1]['final_score'], 180)
             self.assertEqual((summary['by_k'][1]['n'], summary['by_k'][1]['no_valid_test_yet']), (1, 1))
@@ -100,7 +104,7 @@ class EarlySignalTests(unittest.TestCase):
             _, summary = early_signal.write_early_signal(root)
             out = root / 'early_signal'
             for name in ('sessions.csv', 'summary.json', 'A_final_vs_early.png', 'B_prediction_by_k.png',
-                         'C_further_improvement.png', 'D_code_changed_before_first_test.png'):
+                         'D_code_changed_before_first_test.png', 'E_self_tests.png'):
                 self.assertTrue((out / name).exists(), name)
             self.assertEqual(summary['by_k'][5]['n'], 12)
             self.assertGreater(summary['by_k'][5]['r2'], summary['by_k'][1]['r2'])

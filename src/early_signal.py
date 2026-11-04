@@ -15,8 +15,13 @@ Conventions, fixed before data collection:
   - A final scheduler that fails evaluation is plotted at the starting score
     (what the search would keep) and marked; a session with no self-tests, or
     whose generation failed, has no signal and is excluded and counted.
+  - A session that OpenCode ended by auto-rejecting a permission request (the
+    agent reached outside its workspace) was cut off by the harness, not stopped
+    by the agent; it is excluded and counted.
   - A session with fewer than k self-tests, or no valid one yet, is excluded at
     that k and counted.
+  - Near a session's end the best tested score is often the final itself, so a
+    second fit by k keeps only sessions with at least TESTS_LEFT more self-tests.
 """
 import argparse
 import csv
@@ -33,6 +38,8 @@ from .predict import spearman
 from .signals import code_features
 
 MAX_K = 10
+TESTS_LEFT = 3
+MIN_SESSIONS_PER_K = 20
 SESSION_ARM = 'opencode'
 
 
@@ -69,8 +76,11 @@ def session_rows(directory):
                    'final_invalid': r['score'] is None,
                    'excluded': None, 'cost_usd': r.get('observed_cost_usd'),
                    'minutes': r['elapsed_seconds'] / 60}
+            stderr = Path(r['path']) / 'stderr.txt'
             if r['status'] == 'generation_failed':
                 row['excluded'] = 'generation failed'
+            elif stderr.exists() and 'auto-rejecting' in stderr.read_text():
+                row['excluded'] = 'cut off by a rejected permission'
             elif not scores:
                 row['excluded'] = 'no self-tests'
             best = None
@@ -116,15 +126,15 @@ def bootstrap(xs, ys, key, draws=2000, seed=0):
     return values[int(.025 * len(values))], values[int(.975 * len(values)) - 1]
 
 
-def points(rows, signal, outcome='final'):
-    """(x, y, final_invalid) for usable sessions with a value for `signal` (a column name)."""
+def points(rows, signal, min_tests=0):
+    """(x, y, final_invalid) for usable sessions with a value for `signal` (a column name)
+    and at least `min_tests` self-tests."""
     out = []
     for r in rows:
         x = r[signal]
-        if r['excluded'] or x is None:
+        if r['excluded'] or x is None or r['self_tests'] < min_tests:
             continue
-        y = r['final_score'] if outcome == 'final' else r['final_score'] / x
-        out.append((x, y, r['final_invalid']))
+        out.append((x, r['final_score'], r['final_invalid']))
     return out
 
 
@@ -143,14 +153,27 @@ def summarize(rows):
     summary = {'sessions': len(rows), 'usable': len(usable),
                'excluded': {reason: sum(r['excluded'] == reason for r in rows)
                             for reason in {r['excluded'] for r in rows if r['excluded']}},
-               'final_invalid': sum(r['final_invalid'] for r in usable), 'by_k': {},
-               'lines_changed_before_first_test': fit_entry(points(rows, 'lines_changed_before_first_test'))}
+               'final_invalid': sum(r['final_invalid'] for r in usable), 'by_k': {}, 'by_k_tests_left': {},
+               'lines_changed_before_first_test': fit_entry(points(rows, 'lines_changed_before_first_test')),
+               'self_tests': fit_entry(points(rows, 'self_tests'))}
     for k in range(1, MAX_K + 1):
         entry = fit_entry(points(rows, f'best_tested_after_{k}'))
         entry['fewer_than_k_tests'] = sum(r['self_tests'] < k for r in usable)
         entry['no_valid_test_yet'] = sum(r['self_tests'] >= k and r[f'best_tested_after_{k}'] is None for r in usable)
         summary['by_k'][k] = entry
+        summary['by_k_tests_left'][k] = fit_entry(points(rows, f'best_tested_after_{k}',
+                                                         min_tests=k + TESTS_LEFT))
     return summary
+
+
+def verdict(result):
+    """A plain-language reading of a fit, for plot titles."""
+    share = max(result['r2'], 0) * 100
+    if result['r2'] < .1:
+        return f'No clear relationship (explains {share:.0f}%)'
+    if result['r2'] < .3:
+        return f'Weak relationship (explains {share:.0f}%)'
+    return f'Explains {share:.0f}% of the variation'
 
 
 def plot(rows, summary, out, ks=(1, 5)):
@@ -165,14 +188,24 @@ def plot(rows, summary, out, ks=(1, 5)):
                          'ytick.color': ink2, 'text.color': ink, 'font.size': 10, 'axes.titlesize': 11,
                          'axes.titleweight': 'bold', 'axes.titlelocation': 'left', 'axes.spines.top': False,
                          'axes.spines.right': False, 'axes.grid': True, 'grid.color': grid})
-    start = rows[0]['start_score'] if rows else None
-    excluded = ', '.join(f'{count} {reason}' for reason, count in summary['excluded'].items()) or 'none'
-    footnote = (f"{summary['usable']} of {summary['sessions']} sessions usable (excluded: {excluded}). "
-                f"Final scheduler failed evaluation in {summary['final_invalid']}: plotted at the starting score, "
-                f"hollow.")
+    usable = [r for r in rows if not r['excluded']]
+    start = rows[0]['start_score']
+    # Only what applies to this run: exclusions and invalid finals are mentioned when there are any.
+    notes = [f"{len(usable)} of {len(rows)} agent sessions from one starting scheduler (score {start:.1f} s)."]
+    if summary['excluded']:
+        notes.append('Not shown: ' + ', '.join(f'{count} {reason}' for reason, count in summary['excluded'].items())
+                     + '.')
+    if summary['final_invalid']:
+        notes.append(f"{summary['final_invalid']} final schedulers failed evaluation: shown hollow at the "
+                     'starting score.')
+    if usable:
+        finals = [r['final_score'] for r in usable]
+        notes.append(f'Lower scores are better. All shown sessions ended between {min(finals):.1f} and '
+                     f'{max(finals):.1f} s.')
+    footnote = ' '.join(notes)
 
-    def panel(ax, pts, xlabel, heading, outcome='final', short=''):
-        """One scatter with its least-squares line, ±1 residual SD band and statistics in the title."""
+    def panel(ax, pts, xlabel, heading, missing=''):
+        """One scatter with its best-fit line and typical miss, a verdict in the title and numbers below it."""
         xs, ys = [p[0] for p in pts], [p[1] for p in pts]
         result = fit(xs, ys)
         if result:
@@ -180,89 +213,90 @@ def plot(rows, summary, out, ks=(1, 5)):
             line = [result['intercept'] + result['slope'] * x for x in (lo, hi)]
             sd = result['residual_sd']
             ax.fill_between([lo, hi], [v - sd for v in line], [v + sd for v in line], color=band,
-                            zorder=1, label='±1 residual SD')
-            ax.plot([lo, hi], line, color=ink, linewidth=1.5, zorder=2, label='Least-squares fit')
-            spread = f'{sd:.1f} s' if outcome == 'final' else f'{sd:.3f}'
-            rho = f" · ρ = {result['spearman']:.2f}" if result['spearman'] is not None else ''
-            heading += f"\nn = {result['n']} · R² = {result['r2']:.2f} · residual SD = {spread}{rho}"
+                            zorder=1, label=f'Typical miss (±{sd:.1f} s)')
+            ax.plot([lo, hi], line, color=ink, linewidth=1.5, zorder=2, label='Best-fit line')
+            ci = bootstrap(xs, ys, 'r2')
+            details = f"{result['n']} sessions" + (f' · 95% CI {ci[0] * 100:.0f}–{ci[1] * 100:.0f}%' if ci else '')
+            heading = f'{heading}\n{verdict(result)}'
             ax.legend(frameon=False, fontsize=8, loc='best')
         else:
-            reason = (f'All {len(pts)} sessions have the same x value:\nno spread to fit'
+            details = f'{len(pts)} sessions'
+            reason = (f'All {len(pts)} sessions have the same value:\nnothing to fit'
                       if pts and len(set(xs)) == 1 else f'Not enough sessions (n = {len(pts)})')
             ax.text(.5, .5, reason, transform=ax.transAxes, ha='center', va='center', color=ink2)
         for x, y, invalid in pts:
             ax.plot(x, y, marker='o', linestyle='none', markersize=7, zorder=3,
                     markerfacecolor=surface if invalid else blue, markeredgecolor=blue,
                     markeredgewidth=1.5 if invalid else 1)
-        if start and outcome == 'final':
-            ax.axhline(start, color=ink2, linestyle=':', linewidth=1)
-            ax.annotate('starting score', (1, start), xycoords=('axes fraction', 'data'), ha='right',
-                        va='bottom', fontsize=8, color=ink2)
-        if short:
-            heading += f'\n{short}'
-        ax.set(xlabel=xlabel)
-        # Statistics sit in the title so they never cover points.
-        ax.set_title(heading, fontsize=10)
+        if missing:
+            details += f'\n{missing}'
+        ax.set(xlabel=xlabel, ylabel='Final score (s)')
+        # The verdict leads; the numbers sit in smaller grey text so they never cover points.
+        ax.set_title(heading, fontsize=10, pad=8 + 12 * (details.count('\n') + 1))
+        ax.text(0, 1.015, details, transform=ax.transAxes, fontsize=8.5, color=ink2, va='bottom')
 
     def finish(fig, name, title, note):
         fig.suptitle(title, x=.01, ha='left', fontsize=12, fontweight='bold')
-        fig.text(.01, .01, textwrap.fill(note, int(fig.get_figwidth() * 15)), fontsize=8, color=ink2,
-                 ha='left', va='bottom')
-        fig.tight_layout(rect=(0, .07, 1, .94))
+        note = textwrap.fill(note, int(fig.get_figwidth() * 15))
+        fig.text(.01, .01, note, fontsize=8, color=ink2, ha='left', va='bottom')
+        # Reserve room for every footnote line so it never runs into the axis labels.
+        bottom = (.12 + .15 * (note.count('\n') + 1)) / fig.get_figheight()
+        fig.tight_layout(rect=(0, bottom, 1, 1 - .4 / fig.get_figheight()))
         fig.savefig(out / name, dpi=200)
         plt.close(fig)
 
-    def by_k_figure(name, outcome, ylabel, title):
-        fig, axes = plt.subplots(1, len(ks), figsize=(5.2 * len(ks), 4.8), squeeze=False)
-        for ax, k in zip(axes[0], ks):
-            e = summary['by_k'][k]
-            dropped = (f"left out: {e['fewer_than_k_tests']} with < {k} tests, "
-                       f"{e['no_valid_test_yet']} with no valid test yet")
-            panel(ax, points(rows, f'best_tested_after_{k}', outcome),
-                  f'Best score among the first {k} self-test{"s" if k > 1 else ""} (s)', f'k = {k}',
-                  outcome, dropped)
-            ax.set_ylabel(ylabel)
-        finish(fig, name, title, footnote + ' The best tested score is not floored at the starting score, '
-               'so early tests worse than the start count.')
+    # A: the main question.
+    fig, axes = plt.subplots(1, len(ks), figsize=(5.2 * len(ks), 4.8), squeeze=False)
+    for ax, k in zip(axes[0], ks):
+        e = summary['by_k'][k]
+        missing = ', '.join(text for count, text in (
+            (e['fewer_than_k_tests'], f"{e['fewer_than_k_tests']} with fewer than {k} self-tests"),
+            (e['no_valid_test_yet'], f"{e['no_valid_test_yet']} with no successful self-test yet")) if count)
+        panel(ax, points(rows, f'best_tested_after_{k}'),
+              'Score of the first self-test (s)' if k == 1 else f'Best score among the first {k} self-tests (s)',
+              'After 1 self-test' if k == 1 else f'After {k} self-tests',
+              f'Not shown: {missing}' if missing else '')
+    finish(fig, 'A_final_vs_early.png', 'Does the early self-test score predict where the session ends?', footnote)
 
-    by_k_figure('A_final_vs_early.png', 'final', 'Final score (s, lower is better)',
-                'Does the best score in the first k self-tests predict where the session ends?')
-    by_k_figure('C_further_improvement.png', 'further', 'Final ÷ best tested after k (< 1: kept improving)',
-                'Does early progress predict further progress after k?')
+    # B: does prediction improve with more self-tests?
+    fig, ax = plt.subplots(figsize=(7.2, 4.6))
+    shown = {k: e for k, e in summary['by_k_tests_left'].items()
+             if e['n'] >= MIN_SESSIONS_PER_K and e.get('r2') is not None}
+    for k, e in shown.items():
+        if e.get('r2_ci'):
+            ax.plot([k, k], [max(v, 0) * 100 for v in e['r2_ci']], color=band, linewidth=8,
+                    solid_capstyle='butt', zorder=1)
+        ax.plot(k, max(e['r2'], 0) * 100, marker='o', markersize=7, color=blue, zorder=3)
+    if shown:
+        ax.plot(list(shown), [max(e['r2'], 0) * 100 for e in shown.values()], color=blue, linewidth=1.5, zorder=2)
+        best = max(shown, key=lambda k: shown[k]['r2'])
+        heading = (f"At most {max(shown[best]['r2'], 0) * 100:.0f}% of the variation explained "
+                   f'(after {best} self-test{"s" if best > 1 else ""})')
+    else:
+        heading = 'Not enough sessions at any checkpoint'
+    ax.set(xlabel='Self-tests seen so far', ylabel='Variation in final score explained (%)', ylim=(0, 100),
+           xticks=list(shown), xticklabels=[f"{k}\n{e['n']} sessions" for k, e in shown.items()])
+    ax.tick_params(axis='x', labelsize=8.5)
+    ax.set_title(heading, fontsize=10)
+    finish(fig, 'B_prediction_by_k.png', 'Does the early score predict better after more self-tests?',
+           'Variation explained (R²) by a best-fit line from the best score so far to the final score; bars '
+           'are 95% bootstrap intervals. Each point uses only sessions with at least '
+           f'{TESTS_LEFT} more self-tests to go, so the score so far is never just the final scheduler. '
+           f'Points with fewer than {MIN_SESSIONS_PER_K} such sessions are not shown. ' + footnote)
 
     # D: a signal available before any simulation result.
     fig, ax = plt.subplots(figsize=(6.4, 4.8))
     panel(ax, points(rows, 'lines_changed_before_first_test'),
-          'Lines changed from the starting scheduler before the first self-test', 'Code changed before first test')
-    ax.set_ylabel('Final score (s, lower is better)')
-    finish(fig, 'D_code_changed_before_first_test.png',
-           'Does the size of the first edit predict where the session ends?',
-           footnote + ' Lines changed = added plus removed lines in a diff of the starting scheduler and the '
-           'code the agent first tested.')
+          'Lines changed before the first self-test', 'Size of the first edit')
+    finish(fig, 'D_code_changed_before_first_test.png', 'Does the size of the first edit predict the final score?',
+           'Lines changed = lines added plus removed between the starting scheduler and the first version the '
+           'agent tested. ' + footnote)
 
-    # B: how the fit sharpens with k; one measure per panel.
-    fig, axes = plt.subplots(1, 2, figsize=(10.4, 4.2))
-    for ax, key, label in ((axes[0], 'residual_sd', 'Residual SD around the fit (s)'), (axes[1], 'r2', 'R²')):
-        ks_ok = [k for k, e in summary['by_k'].items() if e.get(key) is not None]
-        for k in ks_ok:
-            e = summary['by_k'][k]
-            ci = e.get(f'{key}_ci')
-            if ci:
-                ax.plot([k, k], ci, color=band, linewidth=6, solid_capstyle='round', zorder=1)
-            ax.plot(k, e[key], marker='o', markersize=7, color=blue, zorder=2)
-            ax.annotate(f"n={e['n']}", (k, e[key]), xytext=(0, 9), textcoords='offset points', ha='center',
-                        fontsize=7.5, color=ink2)
-        if ks_ok:
-            ax.plot(ks_ok, [summary['by_k'][k][key] for k in ks_ok], color=blue, linewidth=1.5, zorder=2)
-        ax.set(xlabel='Checkpoint k (self-tests)', ylabel=label, xticks=range(1, MAX_K + 1))
-        if key == 'r2':
-            ax.set_ylim(0, 1.05)
-    axes[0].set_title('Spread around the fit')
-    axes[1].set_title('Variance explained')
-    finish(fig, 'B_prediction_by_k.png',
-           'How early is early enough? Prediction quality by checkpoint (bands: 95% bootstrap)',
-           'Fit of final score on the best score among the first k self-tests. n falls with k because short '
-           'sessions drop out; later checkpoints are biased toward long sessions.')
+    # E: known only at the end, but it shows how much persistence matters.
+    fig, ax = plt.subplots(figsize=(6.4, 4.8))
+    panel(ax, points(rows, 'self_tests'), 'Self-tests the agent ran in the session', 'Number of self-tests')
+    finish(fig, 'E_self_tests.png', 'Do sessions that self-test more end better?',
+           'Known only once the session ends, so this is not an early signal. ' + footnote)
 
 
 def write_early_signal(directory, ks=(1, 5)):

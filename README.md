@@ -88,10 +88,15 @@ uv run python -m src.sweep --mode opencode --repeats 3 --jobs 3 --traces scenari
 uv run python -m src.early_signal runs/sessions-pilot --k 1 5
 ```
 
-`early_signal/` gets `sessions.csv`, `summary.json` and four plots: final score vs the best score
-among the first k self-tests (not floored at the start) with a least-squares fit and ±1 residual SD
-band (A), fit quality by checkpoint with bootstrap intervals (B), improvement after k (C), and final
-score vs lines of code changed before the first self-test (D).
+`early_signal/` gets `sessions.csv`, `summary.json` and four plots, each titled with a plain-language
+verdict: final score vs the best score among the first k self-tests (A); the share of variation in
+final score explained at each checkpoint, using only sessions with at least 3 more self-tests to go
+and at least 20 such sessions (B); final score vs lines changed before the first self-test (D); and
+final score vs the number of self-tests, which is known only at the end (E). There is no plot C: a
+ratio of final to early score plotted against the early score correlates by construction when
+finals barely vary. Sessions that OpenCode ended by auto-rejecting a
+permission request (the agent reached outside its workspace; see `stderr.txt`) are excluded as cut off.
+`./evaluate` copies each tested version and result into the workspace as `./evals/<n>/`.
 
 # RQ3 signals and predictions
 

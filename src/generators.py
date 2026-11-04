@@ -12,7 +12,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from .config import ROOT, TRACE, default_agent_timeout
+from .config import ROOT, SCALES, TRACE, default_agent_timeout, get_canonical_base_params
 from .worker import validate_code
 
 
@@ -135,6 +135,7 @@ scheduler. Reason from the code and the evaluation feedback above.
 
 Leave the final policy in scheduler.py for independent evaluation.
 '''
+    per_scale = get_canonical_base_params(prototype)['subprocess_timeout']
     return prompt + f'''\n## Delivery
 Edit scheduler.py. You may test and revise it within this session's
 {timeout:g}-second limit by running:
@@ -143,7 +144,11 @@ Edit scheduler.py. You may test and revise it within this session's
 ./evaluate
 ```
 
-This uses the evaluation settings above and saves each tested version and result.
+This uses the evaluation settings above and saves each tested version and result
+to ./evals/<n>/. One run can take several minutes (each of the {len(SCALES)} scales may run
+for up to {per_scale:g} seconds), so allow any command that runs it at least
+{len(SCALES) * per_scale:g} seconds.
+Work only inside this directory.
 Leave the final policy in scheduler.py for independent evaluation.
 '''
 
@@ -154,7 +159,8 @@ def write_evaluation_launcher(work, output_dir=None, *, prototype=False, trace=T
     output_dir = (work.parent / 'internal_evals') if output_dir is None else Path(output_dir).resolve()
     command = [sys.executable, '-m', 'src.evaluator',
                '--scheduler', str(work / 'scheduler.py'),
-               '--output-dir', str(output_dir), '--trace', str(trace.resolve())]
+               '--output-dir', str(output_dir), '--trace', str(trace.resolve()),
+               '--copy-to', str(work / 'evals')]
     if prototype:
         command.append('--prototype')
     launcher = work / 'evaluate'
@@ -414,6 +420,8 @@ def generate_opencode(directory, prompt, model, timeout, accounting, *, prototyp
     stdout = (directory / 'response.txt').read_text()
     accounting.update(parse_opencode_usage(stdout))
     accounting['agent_access'] = audit_agent_access(stdout, allowed=[(directory / 'internal_evals').resolve()])
+    # OpenCode run ends the session on an auto-rejected permission request; the agent did not choose to stop.
+    accounting['permission_rejected'] = 'auto-rejecting' in (directory / 'stderr.txt').read_text()
     result = directory / 'workspace' / 'scheduler.py'
     if result.exists():
         shutil.copyfile(result, directory / 'scheduler.py')
