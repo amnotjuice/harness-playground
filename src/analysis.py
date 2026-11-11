@@ -111,9 +111,10 @@ def plot_analysis(directory, report, *, detail=False):
         views.append(('cost', 'Cumulative API cost (USD)', 1, True))
     names = {'direct': 'Direct LLM', 'opencode': 'OpenCode Agent', 'opencode_noeval': 'OpenCode, no evaluator',
              'opencode_best': 'OpenCode + best-score', 'opencode_llm': 'OpenCode + LLM-select',
-             'direct_best': 'Direct + best-score', 'direct_llm': 'Direct + LLM-select'}
+             'direct_best': 'Direct + best-score', 'direct_llm': 'Direct + LLM-select',
+             'openevolve': 'OpenEvolve'}
     colors = {'direct': '#2878B5', 'opencode': '#E07B39', 'opencode_noeval': '#5A9E6F',
-              'opencode_best': '#2878B5', 'opencode_llm': '#E07B39'}
+              'opencode_best': '#2878B5', 'opencode_llm': '#E07B39', 'openevolve': '#8E5BA8'}
     for axis, xlabel, divisor, zoom in views:
         key = 'cumulative_cost_usd' if axis == 'cost' else 'cumulative_elapsed_seconds'
         fig, ax = plt.subplots(figsize=(8, 4.8))

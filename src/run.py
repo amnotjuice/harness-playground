@@ -18,7 +18,14 @@ from .selection import SELECTOR_MAX_TOKENS, select_parent
 
 
 MODES = {'direct': ['direct'], 'opencode': ['opencode'], 'opencode_noeval': ['opencode_noeval'],
-         'both': ['direct', 'opencode'], 'all': ['direct', 'opencode', 'opencode_noeval']}
+         'openevolve': ['openevolve'],
+         'both': ['direct', 'opencode'], 'all': ['direct', 'opencode', 'opencode_noeval'],
+         'harnesses': ['openevolve', 'direct', 'opencode']}
+
+
+def model_variable(generator):
+    """OpenCode arms use OPENCODE_MODEL; the API-call arms (direct, openevolve) use DIRECT_MODEL."""
+    return 'OPENCODE_MODEL' if generator.startswith('opencode') else 'DIRECT_MODEL'
 
 
 def best_candidate(pool):
@@ -67,7 +74,7 @@ def run_arm(arm, args, summary, save, *, generator=None, selector='best'):
     generator = generator or arm
     pool = []
     arm_dir = args.output / 'candidates' / arm
-    model = os.getenv('DIRECT_MODEL' if generator == 'direct' else 'OPENCODE_MODEL', '')
+    model = os.getenv(model_variable(generator), '')
     reasoning = os.getenv('DIRECT_REASONING_EFFORT' if generator == 'direct' else 'OPENCODE_VARIANT')
     arm_summary = {'model': model, 'generator': generator, 'selector': selector,
                    'trajectory': [], 'stop_reason': 'iterations',
@@ -244,7 +251,7 @@ def snapshot_experiment(output, trace=TRACE):
     """Explicit allowlist: capture research inputs, never .env or credentials."""
     names = ['src/' + name for name in [
         '__init__.py', 'run.py', 'config.py', 'evaluator.py', 'worker.py', 'generators.py',
-        'seed.py', 'analysis.py', 'selection.py', 'opencode.json',
+        'seed.py', 'analysis.py', 'selection.py', 'opencode.json', 'openevolve_arm.py', 'openevolve_eval.py',
         'prompts/system.md', 'prompts/context.md', 'prompts/selection.md']]
     names += ['pyproject.toml', 'uv.lock']
     hashes = {}
@@ -262,7 +269,7 @@ def snapshot_experiment(output, trace=TRACE):
     manifest = {
         'created_at_utc': datetime.now(timezone.utc).isoformat(),
         'python_version': sys.version,
-        'packages': {name: version(name) for name in ['eudoxia', 'litellm', 'python-dotenv']},
+        'packages': {name: version(name) for name in ['eudoxia', 'litellm', 'python-dotenv', 'openevolve']},
         'sha256': hashes,
     }
     return manifest
@@ -272,7 +279,8 @@ def main():
     load_dotenv(ROOT / '.env')
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--mode', choices=list(MODES), default=os.getenv('RUN_MODE', 'both'),
-                        help='both: direct and opencode; all: also opencode_noeval (the agent without ./evaluate)')
+                        help='both: direct and opencode; all: also opencode_noeval (the agent without ./evaluate); '
+                             'harnesses: openevolve, direct and opencode')
     parser.add_argument('--selector', choices=['best', 'llm', 'compare'], default='best',
                         help='compare runs best and llm selectors with the same generator')
     parser.add_argument('--iterations', type=int, default=os.getenv('MAX_ITERATIONS', '3'), help='generated children per arm; 0 evaluates seeds only')
@@ -292,6 +300,8 @@ def main():
     args = parser.parse_args()
     if args.selector == 'compare' and len(MODES[args.mode]) > 1:
         parser.error('--selector compare requires one generator: --mode direct, opencode or opencode_noeval')
+    if args.selector != 'best' and 'openevolve' in MODES[args.mode]:
+        parser.error('OpenEvolve chooses its own parents; use --selector best with an openevolve arm')
     args.trace = args.trace.resolve()
     if not args.trace.is_file():
         parser.error(f'Trace file does not exist: {args.trace}')
@@ -315,7 +325,7 @@ def main():
     arms = [name for name, _, _ in conditions]
     if args.iterations > 0:
         for arm in generators:
-            model = os.getenv('DIRECT_MODEL' if arm == 'direct' else 'OPENCODE_MODEL', '')
+            model = os.getenv(model_variable(arm), '')
             if not model:
                 parser.error(f'Set the model for {arm} in {ROOT / ".env"}')
             if model.startswith('openai/') and not os.getenv('OPENAI_API_KEY'):
@@ -356,7 +366,7 @@ def main():
                'opencode_variant': os.getenv('OPENCODE_VARIANT') or None,
                'opencode': ({'path': opencode_path, 'version': opencode_version(opencode_path)}
                             if opencode_path else None),
-               'models': {name: os.getenv('DIRECT_MODEL' if g == 'direct' else 'OPENCODE_MODEL', '')
+               'models': {name: os.getenv(model_variable(g), '')
                           for name, g, _ in conditions},
                'simulation_params': get_canonical_base_params(args.prototype),
                'scales': SCALES, 'trace': args.trace.name, 'trace_source': str(args.trace),
@@ -384,7 +394,12 @@ def main():
     print('arm        iter      score   best_score   elapsed estimated_cost')
     save()
     for arm, generator, selector in conditions:
-        run_arm(arm, args, summary, save, generator=generator, selector=selector)
+        if generator == 'openevolve':
+            from .openevolve_arm import run_openevolve_arm
+            run_openevolve_arm(arm, args, summary, save, model=os.getenv('DIRECT_MODEL', ''),
+                               reasoning=os.getenv('DIRECT_REASONING_EFFORT'))
+        else:
+            run_arm(arm, args, summary, save, generator=generator, selector=selector)
         if summary['arms'][arm]['stop_reason'] == 'harness_error':
             break
     failed = any(a['stop_reason'] in ('generation_error', 'harness_error', 'seed_evaluation_failed', 'cost_unknown') for a in summary['arms'].values())

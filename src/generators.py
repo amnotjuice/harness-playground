@@ -20,17 +20,17 @@ def write_json(path, data):
     path.write_text(json.dumps(data, indent=2, allow_nan=False) + '\n')
 
 
-def get_iteration_feedback_prompt(scheduler_code, evaluation):
+def _number(value, suffix=''):
+    return f'{value:.4f}{suffix}' if isinstance(value, (int, float)) else 'n/a'
+
+
+def evaluation_diagnostics(evaluation):
+    """Eligibility, score and per-scale results of one evaluation, as every arm is shown them."""
     params = evaluation['params']
     results = evaluation['scale_results']
-    scales = evaluation['scales']
-    penalty = 2 * params['max_job_seconds']
-
-    def number(value, suffix=''):
-        return f'{value:.4f}{suffix}' if isinstance(value, (int, float)) else 'n/a'
-
+    number = _number
     rows = []
-    for scale in scales:
+    for scale in evaluation['scales']:
         r = results[str(scale)]
         cpus = params['cpus_per_pool'] * scale
         ram = params['ram_gb_per_pool'] * scale
@@ -56,7 +56,20 @@ def get_iteration_feedback_prompt(scheduler_code, evaluation):
                 rows.append(f'| {priority} | {p["completed"]}/{p["arrived"]} | '
                             f'{number(p.get("mean_s"))} | {number(p.get("p99_s"))} |')
         rows.append('')
+    diagnostics = '\n'.join(rows)
+    return f'''Eligible: {evaluation['ok']}; aggregate score: {number(evaluation['score'], ' s')}.
+Per-priority mean/p99 below cover completed pipelines only; they exclude the
+unfinished penalty. n/a means unavailable, not zero.
 
+{diagnostics}
+'''
+
+
+def evaluation_rules(evaluation):
+    """The objective and simulation settings, which are the same for every candidate in a run."""
+    params = evaluation['params']
+    scales = evaluation['scales']
+    penalty = 2 * params['max_job_seconds']
     settings = (
         f'Trace: {evaluation["trace"]}; the same workload is used at every scale.\n'
         f'Scales: {", ".join(str(s) + "x" for s in scales)}; CPU and RAM scale together.\n'
@@ -67,13 +80,7 @@ def get_iteration_feedback_prompt(scheduler_code, evaluation):
         f'wall-clock timeout: {params["subprocess_timeout"]} s per scale.\n'
         f'Multiple operators per container: {params["multi_operator_containers"]}.'
     )
-    diagnostics = '\n'.join(rows)
-    return f'''## Improvement request
-
-Improve the supplied selected valid parent scheduler. Use its code and
-feedback to choose changes; both incremental improvements and redesigns are allowed.
-
-## Evaluation objective
+    return f'''## Evaluation objective
 
 Lower is better. For every arrived pipeline, latency is its actual end-to-end
 latency if completed, or {penalty:g} seconds if unfinished/failed
@@ -97,7 +104,16 @@ counts, and p99 are diagnostic information, not additional score terms.
 ## Evaluation settings
 
 {settings}
+'''
 
+
+def get_iteration_feedback_prompt(scheduler_code, evaluation):
+    return f'''## Improvement request
+
+Improve the supplied selected valid parent scheduler. Use its code and
+feedback to choose changes; both incremental improvements and redesigns are allowed.
+
+{evaluation_rules(evaluation)}
 ## Parent scheduler
 
 ```python
@@ -106,12 +122,7 @@ counts, and p99 are diagnostic information, not additional score terms.
 
 ## Parent evaluation
 
-Eligible: {evaluation['ok']}; aggregate score: {number(evaluation['score'], ' s')}.
-Per-priority mean/p99 below cover completed pipelines only; they exclude the
-unfinished penalty. n/a means unavailable, not zero.
-
-{diagnostics}
-'''
+{evaluation_diagnostics(evaluation)}'''
 
 
 def build_prompt(code, evaluation):
@@ -200,7 +211,8 @@ def configured_model_prices(model):
     return prices
 
 
-def call_llm(directory, prompt, model, timeout, accounting, *, reasoning_effort=None, max_tokens=None):
+def call_llm(directory, prompt, model, timeout, accounting, *, reasoning_effort=None, max_tokens=None,
+             system=None):
     """One paid call; save the exact prompt, response and usage before parsing."""
     import litellm
     # Models configured in opencode.json are priced from there, so both arms share one
@@ -215,8 +227,12 @@ def call_llm(directory, prompt, model, timeout, accounting, *, reasoning_effort=
             'output_cost_per_token': configured['output'] / 1e6,
             'cache_read_input_token_cost': configured['cache_read'] / 1e6,
             'cache_creation_input_token_cost': configured['cache_write'] / 1e6}})
+    messages = [{'role': 'user', 'content': prompt}]
+    if system is not None:
+        messages.insert(0, {'role': 'system', 'content': system})
+        (directory / 'system_prompt.txt').write_text(system)
     (directory / 'prompt.txt').write_text(prompt)
-    kwargs = {'model': model, 'messages': [{'role': 'user', 'content': prompt}],
+    kwargs = {'model': model, 'messages': messages,
               'num_retries': 0, 'timeout': timeout}
     if reasoning_effort:
         kwargs['reasoning_effort'] = reasoning_effort

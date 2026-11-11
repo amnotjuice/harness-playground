@@ -37,6 +37,22 @@ to run the simulator. Both agent arms work in a temporary directory outside the 
 Each attempt's `generation_usage.agent_access` records tool calls that touched evaluation code,
 eudoxia, the workloads or the repository, plus how often the agent ran `./evaluate`.
 
+`--mode openevolve` runs [OpenEvolve](https://github.com/algorithmicsuperintelligence/openevolve) (0.4.1,
+pinned) as an arm; `--mode harnesses` runs it with `direct` and `opencode`. OpenEvolve's own loop
+(5 MAP-Elites islands, diff edits, top and diverse programs in the prompt) picks parents and builds
+prompts. Three things are shared with the other arms, so the comparison is fair:
+
+- Model calls go through the direct arm's `call_llm` (same `DIRECT_MODEL`, reasoning effort, pricing
+  and retries).
+- Candidates are scored by the same evaluator. The parent's per-scale diagnostics appear in the
+  prompt as an artifact.
+- Each iteration is recorded as `candidates/openevolve/NNN/`, so `holdout`, `analysis` and
+  `signals` read it unchanged.
+
+The budget rule is the same, checked before each model call. One worker runs iterations one at a
+time. The task text and objective go in OpenEvolve's system message. OpenEvolve's logs,
+checkpoints and settings are in `<run>/openevolve/`. Resuming isn't supported.
+
 Simple / Medium / Hard inputs are in `scenarios/`. Select one with
 `--trace scenarios/train/simple.csv`. Validate the inputs with:
 

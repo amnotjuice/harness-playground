@@ -2,7 +2,14 @@
 name = "harness-experiment"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["eudoxia", "litellm>=1.77.5", "python-dotenv>=1.1.1", "setuptools", "matplotlib>=3.9"]
+dependencies = [
+    "eudoxia",
+    "litellm>=1.77.5",
+    "python-dotenv>=1.1.1",
+    "setuptools",
+    "matplotlib>=3.9",
+    "openevolve==0.4.1",
+]
 
 [tool.uv]
 package = false
