@@ -82,7 +82,7 @@ class SelectionTests(unittest.TestCase):
                     'params': {}, 'scale_results': {}}
         with patch.dict('os.environ', {'OPENCODE_MODEL': 'fake', 'OPENCODE_VARIANT': 'medium'}), \
              patch.object(run, 'evaluate_scheduler', side_effect=evaluate), \
-             patch.object(run, 'build_prompt', side_effect=lambda code, evaluation: code), \
+             patch.object(run, 'build_prompt', side_effect=lambda code, evaluation, *_: code), \
              patch.object(run, 'generate_opencode', side_effect=generate), \
              patch.object(selection, 'call_llm', side_effect=call):
             run.run_arm('opencode_llm', args, summary, lambda: None, generator='opencode', selector='llm')

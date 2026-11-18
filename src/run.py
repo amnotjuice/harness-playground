@@ -132,7 +132,8 @@ def run_arm(arm, args, summary, save, *, generator=None, selector='best'):
                 selection_only = remaining is not None and selection_usage['observed_cost_usd'] >= remaining
                 if not selection_only:
                     stage = 'generation'
-                    prompt = build_prompt(source.read_text(), parent['evaluation'])
+                    feedback = getattr(args, 'self_test_feedback', 'full') if generator == 'opencode' else 'full'
+                    prompt = build_prompt(source.read_text(), parent['evaluation'], feedback)
                     (directory / 'prompt.txt').write_text(prompt)
                     generation_usage['estimated_cost_usd'] = None
                     if generator == 'direct':
@@ -140,7 +141,8 @@ def run_arm(arm, args, summary, save, *, generator=None, selector='best'):
                     else:
                         generate_opencode(directory, prompt, model, args.agent_timeout, generation_usage,
                                           prototype=args.prototype, trace=args.trace,
-                                          self_eval=generator == 'opencode')
+                                          self_eval=generator == 'opencode', feedback=feedback,
+                                          max_self_tests=getattr(args, 'max_self_tests', None))
             except (SyntaxError, ValueError, TimeoutError) as exc:
                 # Invalid/missing candidate code or a deadline consumes an attempt.
                 error = f'{type(exc).__name__}: {exc}'
@@ -297,7 +299,17 @@ def main():
     parser.add_argument('--output', type=Path, default=None, help='default: a fresh timestamped directory under runs/')
     parser.add_argument('--start-scheduler', type=Path, default=None,
                         help='scheduler.py every arm starts from instead of src/seed.py (e.g. an earlier best)')
+    parser.add_argument('--self-test-feedback', choices=['full', 'score'], default='full',
+                        help="ablation (--mode opencode only): 'score' shows the agent only eligibility and the "
+                             'aggregate score, from ./evaluate and for the parent in its prompt')
+    parser.add_argument('--max-self-tests', type=int, default=None,
+                        help='ablation (--mode opencode only): ./evaluate refuses after this many runs per session')
     args = parser.parse_args()
+    ablated = args.self_test_feedback != 'full' or args.max_self_tests is not None
+    if ablated and args.mode != 'opencode':
+        parser.error('--self-test-feedback and --max-self-tests apply only to --mode opencode')
+    if args.max_self_tests is not None and args.max_self_tests < 1:
+        parser.error('--max-self-tests must be at least 1')
     if args.selector == 'compare' and len(MODES[args.mode]) > 1:
         parser.error('--selector compare requires one generator: --mode direct, opencode or opencode_noeval')
     if args.selector != 'best' and 'openevolve' in MODES[args.mode]:
@@ -372,7 +384,8 @@ def main():
                'scales': SCALES, 'trace': args.trace.name, 'trace_source': str(args.trace),
                'trace_snapshot': snapshot_trace_name(args.trace),
                'trace_sha256': hashlib.sha256(args.trace.read_bytes()).hexdigest(),
-               'resource_tolerance': RESOURCE_TOLERANCE}
+               'resource_tolerance': RESOURCE_TOLERANCE,
+               'self_test': {'feedback': args.self_test_feedback, 'max_runs': args.max_self_tests}}
     if args.start_scheduler is not None:
         # Start from a frozen copy, so a later edit to the source file cannot change this run.
         saved = args.output / 'snapshot' / 'start_scheduler.py'

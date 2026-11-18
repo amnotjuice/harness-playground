@@ -107,7 +107,14 @@ counts, and p99 are diagnostic information, not additional score terms.
 '''
 
 
-def get_iteration_feedback_prompt(scheduler_code, evaluation):
+def score_only_diagnostics(evaluation):
+    """The parent evaluation for an agent whose ./evaluate reports only the aggregate score."""
+    return (f"Eligible: {evaluation['ok']}; aggregate score: {_number(evaluation['score'], ' s')}.\n"
+            'Per-scale results are not shown in this session.\n')
+
+
+def get_iteration_feedback_prompt(scheduler_code, evaluation, feedback='full'):
+    diagnostics = score_only_diagnostics(evaluation) if feedback == 'score' else evaluation_diagnostics(evaluation)
     return f'''## Improvement request
 
 Improve the supplied selected valid parent scheduler. Use its code and
@@ -122,20 +129,21 @@ feedback to choose changes; both incremental improvements and redesigns are allo
 
 ## Parent evaluation
 
-{evaluation_diagnostics(evaluation)}'''
+{diagnostics}'''
 
 
-def build_prompt(code, evaluation):
+def build_prompt(code, evaluation, feedback='full'):
     system = (ROOT / 'src/prompts/system.md').read_text(encoding='utf-8-sig').replace(
         '{context}', (ROOT / 'src/prompts/context.md').read_text(encoding='utf-8-sig'))
-    return system.rstrip() + '\n\n' + get_iteration_feedback_prompt(code, evaluation)
+    return system.rstrip() + '\n\n' + get_iteration_feedback_prompt(code, evaluation, feedback)
 
 
 def render_direct_prompt(prompt):
     return prompt + '\n## Delivery\nReturn ONLY the complete Python scheduler code. No Markdown fences or prose outside the code.\n'
 
 
-def render_opencode_prompt(prompt, *, prototype=False, timeout=None, self_eval=True):
+def render_opencode_prompt(prompt, *, prototype=False, timeout=None, self_eval=True, feedback='full',
+                           max_self_tests=None):
     if timeout is None:
         timeout = default_agent_timeout(prototype)
     if not self_eval:
@@ -147,6 +155,14 @@ scheduler. Reason from the code and the evaluation feedback above.
 Leave the final policy in scheduler.py for independent evaluation.
 '''
     per_scale = get_canonical_base_params(prototype)['subprocess_timeout']
+    limits = ''
+    if feedback == 'score':
+        limits += ('\nIt reports only whether the scheduler is eligible and its aggregate score, plus the\n'
+                   'error of any scale that fails; no other per-scale results are shown.\n')
+    if max_self_tests is not None:
+        limits += (f'\nYou may run ./evaluate at most {max_self_tests} '
+                   f'time{"s" if max_self_tests != 1 else ""} in this session; later runs are\n'
+                   'refused without evaluating.\n')
     return prompt + f'''\n## Delivery
 Edit scheduler.py. You may test and revise it within this session's
 {timeout:g}-second limit by running:
@@ -159,12 +175,13 @@ This uses the evaluation settings above and saves each tested version and result
 to ./evals/<n>/. One run can take several minutes (each of the {len(SCALES)} scales may run
 for up to {per_scale:g} seconds), so allow any command that runs it at least
 {len(SCALES) * per_scale:g} seconds.
-Work only inside this directory.
+{limits}Work only inside this directory.
 Leave the final policy in scheduler.py for independent evaluation.
 '''
 
 
-def write_evaluation_launcher(work, output_dir=None, *, prototype=False, trace=TRACE):
+def write_evaluation_launcher(work, output_dir=None, *, prototype=False, trace=TRACE, feedback='full',
+                              max_self_tests=None):
     """Resolve this machine's paths at setup; expose only ./evaluate to the agent."""
     work = work.resolve()
     output_dir = (work.parent / 'internal_evals') if output_dir is None else Path(output_dir).resolve()
@@ -174,6 +191,11 @@ def write_evaluation_launcher(work, output_dir=None, *, prototype=False, trace=T
                '--copy-to', str(work / 'evals')]
     if prototype:
         command.append('--prototype')
+    # Ablations add flags only when set, so a default launcher is unchanged.
+    if feedback != 'full':
+        command += ['--feedback', feedback]
+    if max_self_tests is not None:
+        command += ['--max-runs', str(max_self_tests)]
     launcher = work / 'evaluate'
     launcher.write_text('#!/bin/sh\ncd ' + shlex.quote(str(ROOT)) + ' || exit 1\nexec ' + shlex.join(command) + '\n')
     launcher.chmod(0o700)
@@ -398,15 +420,17 @@ def audit_agent_access(stdout, root=ROOT, allowed=()):
 
 
 def generate_opencode(directory, prompt, model, timeout, accounting, *, prototype=False, trace=TRACE,
-                      self_eval=True):
-    rendered = render_opencode_prompt(prompt, prototype=prototype, timeout=timeout, self_eval=self_eval)
+                      self_eval=True, feedback='full', max_self_tests=None):
+    rendered = render_opencode_prompt(prompt, prototype=prototype, timeout=timeout, self_eval=self_eval,
+                                      feedback=feedback, max_self_tests=max_self_tests)
     (directory / 'prompt.txt').write_text(rendered)
     executable, help_text = detect_opencode()
     (directory / 'opencode-help.txt').write_text(help_text)
     # Outside the repository, so the agent's project holds only its task; copied back afterwards.
     work = Path(tempfile.mkdtemp(prefix='scheduler-agent-')).resolve()
     if self_eval:
-        write_evaluation_launcher(work, directory / 'internal_evals', prototype=prototype, trace=trace)
+        write_evaluation_launcher(work, directory / 'internal_evals', prototype=prototype, trace=trace,
+                                  feedback=feedback, max_self_tests=max_self_tests)
     original = (directory / 'scheduler.py').read_text()
     (work / 'scheduler.py').write_text(original)
     (work / 'task.md').write_text(rendered)
@@ -414,7 +438,8 @@ def generate_opencode(directory, prompt, model, timeout, accounting, *, prototyp
     if os.getenv('OPENCODE_VARIANT'):
         cmd += ['--variant', os.environ['OPENCODE_VARIANT']]
     cmd += ['Read task.md and edit scheduler.py as instructed.']
-    write_json(directory / 'command.json', {'argv': cmd, 'cwd': str(work), 'self_eval': self_eval})
+    write_json(directory / 'command.json', {'argv': cmd, 'cwd': str(work), 'self_eval': self_eval,
+                                            'feedback': feedback, 'max_self_tests': max_self_tests})
     env = opencode_environment()
     # OpenCode resolves its root from PWD before falling back to process.cwd().
     # subprocess cwd alone leaves the parent's PWD pointing at the project root.

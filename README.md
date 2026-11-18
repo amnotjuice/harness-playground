@@ -114,6 +114,31 @@ finals barely vary. Sessions that OpenCode ended by auto-rejecting a
 permission request (the agent reached outside its workspace; see `stderr.txt`) are excluded as cut off.
 `./evaluate` copies each tested version and result into the workspace as `./evals/<n>/`.
 
+# Self-test ablations
+
+Two options (`--mode opencode` only) take a capability away from the agent's `./evaluate`. Every
+other setting stays the same, so results compare against an unablated session run from the same
+start:
+
+- `--self-test-feedback score`: the agent sees only eligibility and the aggregate score, both from
+  `./evaluate` (and in its `./evals/<n>/eval.json`) and for the parent in its prompt. If a scale
+  fails, its error is still shown, so a broken scheduler can be fixed. The archive in
+  `internal_evals/` keeps the full result for analysis.
+- `--max-self-tests N`: `./evaluate` refuses (exit 3, nothing evaluated) after N runs in a session.
+  The count is kept in `internal_evals/`, outside the agent's workspace.
+
+Both are recorded in `run_config.json` under `self_test`, and per session in `command.json`.
+
+```sh
+# 10 sessions each from the seed on hard, against runs/sessions-hard-main (40, unablated)
+uv run python -m src.sweep --mode opencode --repeats 10 --jobs 3 --traces scenarios/train/hard.csv \
+  --model openai/gpt-6.1-sol --output runs/ablation-score-only -- --iterations 1 --agent-timeout 7200 \
+  --self-test-feedback score
+uv run python -m src.sweep --mode opencode --repeats 10 --jobs 3 --traces scenarios/train/hard.csv \
+  --model openai/gpt-6.1-sol --output runs/ablation-3-tests -- --iterations 1 --agent-timeout 7200 \
+  --max-self-tests 3
+```
+
 # RQ3 signals and predictions
 
 Build a per-candidate table of predictors (code, parent diagnostics, agent behavior) and
