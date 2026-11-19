@@ -143,7 +143,7 @@ def render_direct_prompt(prompt):
 
 
 def render_opencode_prompt(prompt, *, prototype=False, timeout=None, self_eval=True, feedback='full',
-                           max_self_tests=None):
+                           max_self_tests=None, param_sweep=False):
     if timeout is None:
         timeout = default_agent_timeout(prototype)
     if not self_eval:
@@ -163,6 +163,23 @@ Leave the final policy in scheduler.py for independent evaluation.
         limits += (f'\nYou may run ./evaluate at most {max_self_tests} '
                    f'time{"s" if max_self_tests != 1 else ""} in this session; later runs are\n'
                    'refused without evaluating.\n')
+    if param_sweep:
+        from .param_sweep import MAX_VALUES, PARALLEL
+        rounds = -(-MAX_VALUES // PARALLEL)
+        limits += f'''
+To compare several values of one setting at once, make it a module-level constant
+in scheduler.py (for example `RAM_GB = 48.0`) and run:
+
+```sh
+./sweep RAM_GB 40 48 56 64
+```
+
+Each value is evaluated as ./evaluate would, on its own copy of scheduler.py, up
+to {MAX_VALUES} values per sweep and {PARALLEL} at a time; scheduler.py itself is not changed. It
+prints each value's score, per-scale latency and OOM count, and saves each variant
+and its full result to ./sweeps/<n>/. Allow any command that runs a full sweep at
+least {rounds * len(SCALES) * per_scale:g} seconds.
+'''
     return prompt + f'''\n## Delivery
 Edit scheduler.py. You may test and revise it within this session's
 {timeout:g}-second limit by running:
@@ -198,6 +215,24 @@ def write_evaluation_launcher(work, output_dir=None, *, prototype=False, trace=T
         command += ['--max-runs', str(max_self_tests)]
     launcher = work / 'evaluate'
     launcher.write_text('#!/bin/sh\ncd ' + shlex.quote(str(ROOT)) + ' || exit 1\nexec ' + shlex.join(command) + '\n')
+    launcher.chmod(0o700)
+    return launcher
+
+
+def write_sweep_launcher(work, output_dir=None, *, prototype=False, trace=TRACE):
+    """./sweep NAME VALUE...: evaluate scheduler.py with one constant set to each value."""
+    work = work.resolve()
+    output_dir = (work.parent / 'internal_sweeps') if output_dir is None else Path(output_dir).resolve()
+    command = [sys.executable, '-m', 'src.param_sweep',
+               '--scheduler', str(work / 'scheduler.py'),
+               '--output-dir', str(output_dir), '--trace', str(trace.resolve()),
+               '--copy-to', str(work / 'sweeps')]
+    if prototype:
+        command.append('--prototype')
+    launcher = work / 'sweep'
+    # The agent's arguments follow the fixed ones.
+    launcher.write_text('#!/bin/sh\ncd ' + shlex.quote(str(ROOT)) + ' || exit 1\nexec '
+                        + shlex.join(command) + ' "$@"\n')
     launcher.chmod(0o700)
     return launcher
 
@@ -390,7 +425,7 @@ def audit_agent_access(stdout, root=ROOT, allowed=()):
     """
     markers = ACCESS_MARKERS + (str(root),)
     hits = []
-    self_eval_calls = 0
+    self_eval_calls = sweep_calls = 0
     def inputs(value, inside=False):
         if isinstance(value, dict):
             for key, item in value.items():
@@ -410,19 +445,22 @@ def audit_agent_access(stdout, root=ROOT, allowed=()):
             continue
         for text in inputs(event.get('part', event)):
             self_eval_calls += './evaluate' in text
+            sweep_calls += './sweep ' in text
             for path in allowed:
                 text = text.replace(str(path), '')
             found = sorted(m for m in markers if m in text)
             if found:
                 hits.append({'markers': found, 'input': text[:300]})
     return {'markers': sorted({m for h in hits for m in h['markers']}), 'tool_calls': hits,
-            'self_eval_calls': self_eval_calls}
+            'self_eval_calls': self_eval_calls, 'sweep_calls': sweep_calls}
 
 
 def generate_opencode(directory, prompt, model, timeout, accounting, *, prototype=False, trace=TRACE,
-                      self_eval=True, feedback='full', max_self_tests=None):
+                      self_eval=True, feedback='full', max_self_tests=None, param_sweep=False):
+    if param_sweep and not self_eval:
+        raise ValueError('./sweep needs ./evaluate')
     rendered = render_opencode_prompt(prompt, prototype=prototype, timeout=timeout, self_eval=self_eval,
-                                      feedback=feedback, max_self_tests=max_self_tests)
+                                      feedback=feedback, max_self_tests=max_self_tests, param_sweep=param_sweep)
     (directory / 'prompt.txt').write_text(rendered)
     executable, help_text = detect_opencode()
     (directory / 'opencode-help.txt').write_text(help_text)
@@ -431,6 +469,8 @@ def generate_opencode(directory, prompt, model, timeout, accounting, *, prototyp
     if self_eval:
         write_evaluation_launcher(work, directory / 'internal_evals', prototype=prototype, trace=trace,
                                   feedback=feedback, max_self_tests=max_self_tests)
+    if param_sweep:
+        write_sweep_launcher(work, directory / 'internal_sweeps', prototype=prototype, trace=trace)
     original = (directory / 'scheduler.py').read_text()
     (work / 'scheduler.py').write_text(original)
     (work / 'task.md').write_text(rendered)
@@ -439,7 +479,8 @@ def generate_opencode(directory, prompt, model, timeout, accounting, *, prototyp
         cmd += ['--variant', os.environ['OPENCODE_VARIANT']]
     cmd += ['Read task.md and edit scheduler.py as instructed.']
     write_json(directory / 'command.json', {'argv': cmd, 'cwd': str(work), 'self_eval': self_eval,
-                                            'feedback': feedback, 'max_self_tests': max_self_tests})
+                                            'feedback': feedback, 'max_self_tests': max_self_tests,
+                                            'param_sweep': param_sweep})
     env = opencode_environment()
     # OpenCode resolves its root from PWD before falling back to process.cwd().
     # subprocess cwd alone leaves the parent's PWD pointing at the project root.
@@ -460,7 +501,7 @@ def generate_opencode(directory, prompt, model, timeout, accounting, *, prototyp
         shutil.rmtree(work, ignore_errors=True)
     stdout = (directory / 'response.txt').read_text()
     accounting.update(parse_opencode_usage(stdout))
-    accounting['agent_access'] = audit_agent_access(stdout, allowed=[(directory / 'internal_evals').resolve()])
+    accounting['agent_access'] = audit_agent_access(stdout, allowed=[(directory / 'internal_evals').resolve(), (directory / 'internal_sweeps').resolve()])
     # OpenCode run ends the session on an auto-rejected permission request; the agent did not choose to stop.
     accounting['permission_rejected'] = 'auto-rejecting' in (directory / 'stderr.txt').read_text()
     result = directory / 'workspace' / 'scheduler.py'

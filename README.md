@@ -53,6 +53,21 @@ The budget rule is the same, checked before each model call. One worker runs ite
 time. The task text and objective go in OpenEvolve's system message. OpenEvolve's logs,
 checkpoints and settings are in `<run>/openevolve/`. Resuming isn't supported.
 
+`--mode openevolve_agent` keeps OpenEvolve's search but makes each edit with an OpenCode session
+instead of one model call. OpenEvolve still picks the parent and island and builds the prompt (top
+and diverse programs, the parent's diagnostics). The agent gets that prompt with the parent already
+in `scheduler.py`, can run `./evaluate` as the `opencode` arm does, and its final file goes back to
+OpenEvolve as a full rewrite (`diff_based_evolution` is off). It uses `OPENCODE_MODEL`,
+`--agent-timeout` and the `opencode` budget reserve. Each iteration's directory holds the session as
+the `opencode` arm's do (`response.txt`, `workspace/`, `internal_evals/`). A hard-trace session costs
+about $0.33, so few iterations fit a budget; `--openevolve-islands 2` lets each island evolve.
+
+```sh
+uv run python -m src.sweep --mode openevolve_agent --repeats 3 --jobs 3 --traces scenarios/train/hard.csv \
+  --model openai/gpt-6.1-sol --output runs/openevolve-agent-hard -- --budget-usd 6 --budget-guard \
+  --budget-slack-usd 0.10 --iterations 1000 --agent-timeout 7200 --openevolve-islands 2
+```
+
 Simple / Medium / Hard inputs are in `scenarios/`. Select one with
 `--trace scenarios/train/simple.csv`. Validate the inputs with:
 
@@ -127,7 +142,13 @@ start:
 - `--max-self-tests N`: `./evaluate` refuses (exit 3, nothing evaluated) after N runs in a session.
   The count is kept in `internal_evals/`, outside the agent's workspace.
 
-Both are recorded in `run_config.json` under `self_test`, and per session in `command.json`.
+The reverse, an added capability: `--param-sweep` also gives the agent `./sweep NAME VALUE...`
+(up to 8 values, 4 evaluated at a time). It evaluates `scheduler.py` with one module-level constant
+set to each value, prints each value's score, per-scale latency and OOM count, and leaves
+`scheduler.py` unchanged. Sweeps are archived in `internal_sweeps/`, separately from `./evaluate`
+runs in `internal_evals/`, so self-test counts stay comparable; the audit counts `sweep_calls`.
+
+All three are recorded in `run_config.json` under `self_test`, and per session in `command.json`.
 
 ```sh
 # 10 sessions each from the seed on hard, against runs/sessions-hard-main (40, unablated)
@@ -137,7 +158,13 @@ uv run python -m src.sweep --mode opencode --repeats 10 --jobs 3 --traces scenar
 uv run python -m src.sweep --mode opencode --repeats 10 --jobs 3 --traces scenarios/train/hard.csv \
   --model openai/gpt-6.1-sol --output runs/ablation-3-tests -- --iterations 1 --agent-timeout 7200 \
   --max-self-tests 3
+uv run python -m src.sweep --mode opencode --repeats 10 --jobs 2 --traces scenarios/train/hard.csv \
+  --model openai/gpt-6.1-sol --output runs/ablation-param-sweep -- --iterations 1 --agent-timeout 7200 \
+  --param-sweep
 ```
+
+With `--param-sweep`, use `--jobs 2`: each sweep runs 4 simulations at once, and hard-trace scales
+can hit their 180 s timeout under heavy load.
 
 # RQ3 signals and predictions
 

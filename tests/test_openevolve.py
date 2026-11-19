@@ -43,7 +43,9 @@ def fake_llm(response, cost=.3, error=None):
     return call
 
 
-class OpenEvolveArmTests(unittest.TestCase):
+class ForkedOpenEvolveTest(unittest.TestCase):
+    """Forks OpenEvolve's worker so the patches reach it; shared checks on OpenEvolve's own records."""
+
     @classmethod
     def setUpClass(cls):
         cls.start_method = multiprocessing.get_start_method(allow_none=True)
@@ -52,6 +54,15 @@ class OpenEvolveArmTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         multiprocessing.set_start_method(cls.start_method, force=True)
+
+    def assert_openevolve_kept_children(self, args, rows):
+        """OpenEvolve's own database, not just the harness records, must contain the children."""
+        info = json.loads((args.output / 'openevolve/output/best/best_program_info.json').read_text())
+        self.assertEqual(-info['metrics']['combined_score'], min(r['score'] for r in rows if r['score'] is not None))
+        self.assertLess(-info['metrics']['combined_score'], rows[0]['score'])
+
+
+class OpenEvolveArmTests(ForkedOpenEvolveTest):
 
     def run_arm(self, temp, llm, *, budget=1.0, iterations=12, guard=False):
         args = argparse.Namespace(output=Path(temp), trace=TRACE, iterations=iterations, prototype=True,
@@ -87,12 +98,6 @@ class OpenEvolveArmTests(unittest.TestCase):
             # The shared analysis reads the arm unchanged.
             (args.output / 'run_config.json').write_text(json.dumps({'trace': 'fake.csv'}))
             write_analysis(args.output, {'arms': {'openevolve': arm}})
-
-    def assert_openevolve_kept_children(self, args, rows):
-        """OpenEvolve's own database, not just the harness records, must contain the children."""
-        info = json.loads((args.output / 'openevolve/output/best/best_program_info.json').read_text())
-        self.assertEqual(-info['metrics']['combined_score'], min(r['score'] for r in rows if r['score'] is not None))
-        self.assertLess(-info['metrics']['combined_score'], rows[0]['score'])
 
     def test_children_reach_openevolve_when_the_provider_reports_no_tokens(self):
         def llm(directory, prompt, model, timeout, accounting, *, reasoning_effort=None, system=None):
@@ -130,6 +135,81 @@ class OpenEvolveArmTests(unittest.TestCase):
             self.assertEqual(arm['stop_reason'], 'cost_unknown')
             self.assertEqual(len(arm['trajectory']), 2)
             self.assertFalse(arm['cost_complete'])
+
+
+def fake_agent(cost=.3, error=None, seen=None):
+    """Stands in for generate_opencode: edits the parent in directory/scheduler.py, as a session would."""
+    def session(directory, task, model, timeout, accounting, *, prototype=False, trace=None):
+        accounting.update(model_invocations=1)
+        (directory / 'prompt.txt').write_text(task)
+        if seen is not None:
+            seen.append({'task': task, 'parent': (directory / 'scheduler.py').read_text(), 'timeout': timeout})
+        if error:
+            raise error
+        path = directory / 'scheduler.py'
+        # Mid-file: OpenEvolve's parser strips the file's leading and trailing whitespace.
+        first, rest = path.read_text().split('\n', 1)
+        path.write_text(first + '\n' + TWEAK + rest)
+        accounting.update(input_tokens=10, output_tokens=5, estimated_cost_usd=cost, observed_cost_usd=cost)
+    return session
+
+
+class OpenEvolveAgentArmTests(ForkedOpenEvolveTest):
+    """OpenEvolve's search with an OpenCode session making each edit."""
+
+    def run_arm(self, temp, session, *, budget=1.0, iterations=12, islands=2):
+        args = argparse.Namespace(output=Path(temp), trace=TRACE, iterations=iterations, prototype=True,
+                                  budget_usd=budget, budget_guard=False, budget_slack_usd=0, timeout=5,
+                                  agent_timeout=900, openevolve_islands=islands)
+        summary = {'arms': {}}
+        with patch.object(openevolve_arm, 'evaluate_scheduler', side_effect=fake_evaluation), \
+             patch.object(openevolve_arm, 'generate_opencode', side_effect=session), \
+             patch.object(openevolve_arm, 'call_llm', side_effect=AssertionError('no direct calls')):
+            openevolve_arm.run_openevolve_arm('openevolve_agent', args, summary, lambda: None,
+                                              model='fake-model', reasoning=None, agent=True)
+        return args, summary['arms']['openevolve_agent']
+
+    def test_each_iteration_is_an_agent_session_whose_file_becomes_the_child(self):
+        seen = []
+        with tempfile.TemporaryDirectory() as temp:
+            args, arm = self.run_arm(temp, fake_agent(seen=seen))
+            rows = arm['trajectory']
+            self.assertEqual(arm['stop_reason'], 'budget')
+            self.assertEqual([r['iteration'] for r in rows], [0, 1, 2, 3, 4])
+            self.assertEqual({r['generator'] for r in rows}, {'openevolve_agent'})
+            self.assertEqual(rows[1]['status'], 'improved')
+            self.assertEqual(rows[1]['score'], 99.0)
+            self.assertLess(min(r['score'] for r in rows), 99.0)
+            self.assert_openevolve_kept_children(args, rows)
+            # The session starts from OpenEvolve's chosen parent and gets OpenEvolve's prompt plus the note.
+            parents = {Path(r['path']).joinpath('scheduler.py').read_text() for r in rows}
+            for call in seen:
+                self.assertIn(call['parent'], parents)
+                self.assertIn('Evaluation objective', call['task'])
+                self.assertIn('# Current Program', call['task'])
+                self.assertIn('already in scheduler.py', call['task'])
+                self.assertNotIn('Follow the output format requested', call['task'])
+                self.assertEqual(call['timeout'], 900)
+            record = arm['openevolve']
+            self.assertFalse(record['diff_based_evolution'])
+            self.assertEqual(record['num_islands'], 2)
+            self.assertGreaterEqual(record['evaluator_timeout_seconds'], 900 + 2 * 120)
+
+    def test_a_timed_out_session_is_a_failed_attempt_not_a_stop(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _, arm = self.run_arm(temp, fake_agent(error=TimeoutError('OpenCode session timed out')), budget=None,
+                                  iterations=2)
+            rows = arm['trajectory'][1:]
+            self.assertEqual(len(rows), 2)
+            for row in rows:
+                self.assertEqual(row['status'], 'generation_failed')
+                self.assertFalse(row['error_fatal'])
+                self.assertIn('timed out', row['error'])
+
+    def test_a_file_openevolve_would_misparse_is_refused(self):
+        self.assertEqual(openevolve_arm.agent_rewrite_response('x = 1\n'), '```python\nx = 1\n\n```')
+        with self.assertRaisesRegex(ValueError, 'intact'):
+            openevolve_arm.agent_rewrite_response('"""Use ```python fences```."""\nx = 1\n')
 
 
 if __name__ == '__main__':

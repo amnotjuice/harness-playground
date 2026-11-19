@@ -115,6 +115,81 @@ class PromptAblationTests(unittest.TestCase):
         self.assertIn('64 CPUs / 500 GB', score)
 
 
+class ParamSweepTests(unittest.TestCase):
+    CODE = '"""Doc."""\nRAM_GB = 48.0  # starting RAM\nCPU: float = 7\n\ndef f():\n    RAM_GB = 1\n    return RAM_GB\n'
+
+    def test_substitute_changes_only_the_module_level_constant(self):
+        from src.param_sweep import substitute
+        changed = substitute(self.CODE, 'RAM_GB', '55')
+        self.assertIn('RAM_GB = 55  # starting RAM', changed)
+        self.assertIn('    RAM_GB = 1\n', changed)
+        self.assertIn('CPU: float = 8', substitute(self.CODE, 'CPU', '8'))
+        with self.assertRaisesRegex(ValueError, 'no module-level'):
+            substitute(self.CODE, 'MISSING', '1')
+        with self.assertRaisesRegex(ValueError, '2 module-level'):
+            substitute(self.CODE + 'RAM_GB = 3\n', 'RAM_GB', '1')
+
+    def test_sweep_evaluates_each_value_on_a_copy_and_reports_a_table(self):
+        from src import param_sweep
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            source = base / 'work/scheduler.py'
+            source.parent.mkdir()
+            source.write_text(self.CODE)
+            seen = {}
+            def evaluate(path, **kwargs):
+                seen[path.read_text().split('RAM_GB = ')[1].split()[0]] = path
+                return dict(full_evaluation(), score=float(len(seen)))
+            args = ['RAM_GB', '40', '56', '--scheduler', str(source), '--output-dir', str(base / 'internal_sweeps'),
+                    '--copy-to', str(base / 'work/sweeps')]
+            with patch.object(param_sweep, 'evaluate_scheduler', side_effect=evaluate), \
+                 contextlib.redirect_stdout(io.StringIO()) as printed:
+                self.assertEqual(param_sweep.main(args), 0)
+            self.assertEqual(sorted(seen), ['40', '56'])
+            self.assertEqual(source.read_text(), self.CODE)
+            self.assertIn('| 40 |', printed.getvalue())
+            self.assertIn('24', printed.getvalue())  # OOMs summed over the two scales
+            copies = sorted((base / 'work/sweeps/1').glob('*/eval.json'))
+            self.assertEqual(len(copies), 2)
+            self.assertEqual(len(list((base / 'internal_sweeps').glob('*/summary.json'))), 1)
+
+    def test_bad_requests_are_refused_without_evaluating(self):
+        from src import param_sweep
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / 'scheduler.py'
+            source.write_text(self.CODE)
+            common = ['--scheduler', str(source), '--output-dir', str(Path(temp) / 'out')]
+            for request in (['RAM_GB', 'abc'], ['RAM_GB', '1', '1'], ['NOPE', '1'], ['RAM_GB'] + [str(i) for i in range(9)]):
+                with patch.object(param_sweep, 'evaluate_scheduler') as evaluate, \
+                     contextlib.redirect_stdout(io.StringIO()) as printed:
+                    self.assertEqual(param_sweep.main(request + common), 2)
+                evaluate.assert_not_called()
+                self.assertIn('Sweep not run', printed.getvalue())
+
+    def test_launcher_forwards_the_agents_arguments(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            (root / 'src').mkdir()
+            (root / 'src/__init__.py').write_text('')
+            (root / 'src/param_sweep.py').write_text('import json, sys\nprint(json.dumps(sys.argv[1:]))\n')
+            work = root / 'candidate/workspace'
+            work.mkdir(parents=True)
+            with patch.object(generators, 'ROOT', root):
+                launcher = generators.write_sweep_launcher(work)
+            argv = json.loads(subprocess.run([str(launcher), 'RAM_GB', '40', "'quoted value'"],
+                                             capture_output=True, text=True, check=True).stdout)
+            self.assertEqual(argv[-3:], ['RAM_GB', '40', "'quoted value'"])
+            self.assertEqual(argv[argv.index('--output-dir') + 1], str(root / 'candidate/internal_sweeps'))
+
+    def test_task_text_and_audit_mention_sweep_only_when_enabled(self):
+        self.assertNotIn('./sweep', generators.render_opencode_prompt('task', timeout=60))
+        text = generators.render_opencode_prompt('task', timeout=60, param_sweep=True)
+        self.assertIn('./sweep RAM_GB 40 48 56 64', text)
+        self.assertIn('scheduler.py itself is not changed', text)
+        event = json.dumps({'type': 'tool_use', 'part': {'tool': 'bash', 'state': {'input': {'command': './sweep X 1 2'}}}})
+        self.assertEqual(generators.audit_agent_access(event)['sweep_calls'], 1)
+
+
 class RunAblationTests(unittest.TestCase):
     def test_agent_arm_receives_the_ablation_and_its_prompt_hides_diagnostics(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -130,9 +205,22 @@ class RunAblationTests(unittest.TestCase):
             self.assertEqual(prompt.call_args.args[2], 'score')
             self.assertEqual((agent.call_args.kwargs['feedback'], agent.call_args.kwargs['max_self_tests']),
                              ('score', 3))
+            self.assertFalse(agent.call_args.kwargs['param_sweep'])
+
+    def test_agent_arm_receives_the_sweep_tool(self):
+        with tempfile.TemporaryDirectory() as temp:
+            args = argparse.Namespace(output=Path(temp), trace=ROOT / 'scenarios/train/simple.csv',
+                                      iterations=1, prototype=True, budget_usd=None, timeout=1, agent_timeout=2,
+                                      param_sweep=True)
+            with patch.dict(os.environ, {'OPENCODE_MODEL': 'fake'}), \
+                 patch.object(run, 'evaluate_scheduler', return_value={'ok': True, 'score': 10}), \
+                 patch.object(run, 'build_prompt', return_value='task'), \
+                 patch.object(run, 'generate_opencode') as agent:
+                run.run_arm('opencode', args, {'arms': {}}, lambda: None)
+            self.assertTrue(agent.call_args.kwargs['param_sweep'])
 
     def test_ablation_flags_are_refused_outside_the_agent_arm(self):
-        for flags in (['--self-test-feedback', 'score'], ['--max-self-tests', '3']):
+        for flags in (['--self-test-feedback', 'score'], ['--max-self-tests', '3'], ['--param-sweep']):
             result = subprocess.run([sys.executable, '-m', 'src.run', '--mode', 'direct', '--iterations', '0',
                                      '--prototype', *flags], cwd=ROOT, capture_output=True, text=True)
             self.assertEqual(result.returncode, 2)

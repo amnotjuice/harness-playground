@@ -26,7 +26,7 @@ from openevolve.evaluation_result import EvaluationResult
 
 from .config import ROOT
 from .evaluator import evaluate_scheduler
-from .generators import call_llm, evaluation_diagnostics, evaluation_rules, write_json
+from .generators import call_llm, evaluation_diagnostics, evaluation_rules, generate_opencode, write_json
 from .worker import validate_code
 
 SETTINGS_ENV = 'HARNESS_OPENEVOLVE_SETTINGS'
@@ -79,7 +79,7 @@ def budget_refusal(settings, rows):
         return {'reason': 'budget'}
     if settings['budget_guard'] and any(r['iteration'] for r in rows):
         slack = settings['budget_slack_usd']
-        reserve = next_round_reserve(rows, 'direct', slack)
+        reserve = next_round_reserve(rows, 'opencode' if settings.get('agent') else 'direct', slack)
         if budget + slack - known < reserve:
             return {'reason': 'budget_reserve', 'next_round_reserve_usd': reserve}
     return None
@@ -173,8 +173,71 @@ class HarnessLLM:
         return raw
 
 
+AGENT_TASK_NOTE = """
+## How to work in this session
+
+The current program above is already in scheduler.py. Instead of replying with code,
+edit scheduler.py; ignore any instruction above about the format of a reply. The other
+programs above are for reference only and are not in this directory.
+"""
+
+
+def agent_rewrite_response(code):
+    """The agent's final scheduler.py as a reply OpenEvolve's full-rewrite parser returns unchanged."""
+    from openevolve.utils.code_utils import parse_full_rewrite
+    reply = f'```python\n{code}\n```'
+    if parse_full_rewrite(reply, 'python') != code.strip():
+        raise ValueError('The final scheduler.py cannot be passed to OpenEvolve intact (it contains ```)')
+    return reply
+
+
+class AgentLLM(HarnessLLM):
+    """OpenEvolve model client that runs one OpenCode session (with ./evaluate) per iteration.
+
+    OpenEvolve still picks the parent and builds the prompt (top and diverse programs, the parent's
+    diagnostics). The agent starts from the parent in scheduler.py, may self-test, and its final file
+    is returned to OpenEvolve as a full rewrite."""
+
+    async def generate_with_context(self, system_message, messages, **kwargs):
+        context = CURRENT
+        if context is None:
+            raise RuntimeError('Agent session outside a recorded iteration')
+        refusal = budget_refusal(self.settings, recorded_rows(self.settings['arm_dir']))
+        if refusal:
+            context['refused'] = refusal
+            request_stop(self.settings, refusal['reason'], refusal)
+            raise BudgetStop(refusal['reason'])
+        if context['usage']['model_invocations']:
+            raise RuntimeError('A second agent session in one iteration is not supported')
+        directory = context['directory']
+        task = '\n\n'.join([system_message or ''] + [m['content'] for m in messages]).strip() + '\n' + AGENT_TASK_NOTE
+        usage = context['usage']
+        usage['estimated_cost_usd'] = None
+        try:
+            # generate_opencode runs the session in a scratch workspace holding the parent as scheduler.py,
+            # then copies the final file back to directory/scheduler.py.
+            await asyncio.to_thread(generate_opencode, directory, task, self.settings['model'],
+                                    self.settings['agent_timeout'], usage, prototype=self.settings['prototype'],
+                                    trace=Path(self.settings['trace']))
+            reply = agent_rewrite_response((directory / 'scheduler.py').read_text())
+        except (TimeoutError, ValueError, SyntaxError) as exc:
+            # As in run.py: a deadline or unusable code consumes the attempt without stopping the arm.
+            context['generation_error'] = f'{type(exc).__name__}: {exc}'
+            raise
+        except Exception as exc:
+            context['generation_error'] = f'{type(exc).__name__}: {exc}'
+            context['fatal'] = True
+            raise
+        finally:
+            usage['model_invocations'] = max(usage.get('model_invocations') or 0, 1)
+        prompt_tokens, completion_tokens = usage.get('input_tokens') or 0, usage.get('output_tokens') or 0
+        self.last_usage = {'prompt_tokens': prompt_tokens, 'completion_tokens': completion_tokens,
+                           'total_tokens': prompt_tokens + completion_tokens, 'model': self.settings['model']}
+        return reply
+
+
 def init_client(model_config):
-    return HarnessLLM(model_config)
+    return AgentLLM(model_config) if load_settings().get('agent') else HarnessLLM(model_config)
 
 
 def recorded_iteration(iteration, db_snapshot, parent_id, inspiration_ids):
@@ -243,7 +306,7 @@ def recorded_iteration(iteration, db_snapshot, parent_id, inspiration_ids):
            'path': str(directory.resolve()), 'model': settings['model'], 'score': evaluation['score'],
            'best_score': best_score, 'best_path': best_path, 'elapsed_seconds': elapsed, 'error': error,
            'status': status, 'error_fatal': bool(context.get('fatal') or context.get('harness_error')),
-           'generator': 'openevolve', 'selector': 'openevolve',
+           'generator': settings.get('generator', 'openevolve'), 'selector': 'openevolve',
            'selection_usage': selection_usage, 'generation_usage': dict(usage),
            'selected_parent_rank': None, 'selection_fallback': False,
            'scheduler_sha256': hashlib.sha256((directory / 'scheduler.py').read_bytes()).hexdigest(),
@@ -265,12 +328,14 @@ def recorded_iteration(iteration, db_snapshot, parent_id, inspiration_ids):
     return result
 
 
-def system_message(seed_evaluation):
-    """The task text every arm gets (system.md with context.md), plus the objective and settings."""
+def system_message(seed_evaluation, agent=False):
+    """The task text every arm gets (system.md with context.md), plus the objective and settings.
+
+    The agent's delivery instructions (edit scheduler.py, ./evaluate) are added to its task instead."""
     system = (ROOT / 'src/prompts/system.md').read_text(encoding='utf-8-sig').replace(
         '{context}', (ROOT / 'src/prompts/context.md').read_text(encoding='utf-8-sig'))
-    return (system.rstrip() + '\n\n' + evaluation_rules(seed_evaluation)
-            + '\n## Delivery\nFollow the output format requested in the user message.\n')
+    text = system.rstrip() + '\n\n' + evaluation_rules(seed_evaluation)
+    return text if agent else text + '\n## Delivery\nFollow the output format requested in the user message.\n'
 
 
 def openevolve_config(args, settings, seed_evaluation):
@@ -286,7 +351,13 @@ def openevolve_config(args, settings, seed_evaluation):
     config.llm.models = [LLMModelConfig(name=settings['model'], init_client=init_client, weight=1.0,
                                         random_seed=settings['random_seed'])]
     config.llm.evaluator_models = []
-    config.prompt.system_message = system_message(seed_evaluation)
+    agent = settings.get('agent', False)
+    config.prompt.system_message = system_message(seed_evaluation, agent)
+    if agent:
+        # The agent edits the whole file; its result reaches OpenEvolve as a full rewrite.
+        config.diff_based_evolution = False
+    if getattr(args, 'openevolve_islands', None):
+        config.database.num_islands = args.openevolve_islands
     config.database.random_seed = settings['random_seed']
     config.evaluator.cascade_evaluation = False
     config.evaluator.use_llm_feedback = False
@@ -296,6 +367,10 @@ def openevolve_config(args, settings, seed_evaluation):
     # Above the harness's own bound (every scale at its subprocess timeout), so it never fires first.
     params = seed_evaluation['params']
     config.evaluator.timeout = int(len(seed_evaluation['scales']) * params['subprocess_timeout'] + 300)
+    if agent:
+        # OpenEvolve gives the whole iteration (generation included) evaluator.timeout + 30 s; an agent
+        # session can take up to agent_timeout before its own evaluation.
+        config.evaluator.timeout += int(settings['agent_timeout'])
     return config
 
 
@@ -323,7 +398,7 @@ def random_seed_for(output):
     return int(hashlib.sha256(str(Path(output).resolve()).encode()).hexdigest()[:8], 16)
 
 
-def run_openevolve_arm(arm, args, summary, save, *, model, reasoning):
+def run_openevolve_arm(arm, args, summary, save, *, model, reasoning, agent=False):
     """Evaluate the start as 000_seed, then let OpenEvolve run args.iterations iterations."""
     from openevolve import OpenEvolve
     from openevolve.controller import EvolutionFailedError
@@ -334,7 +409,8 @@ def run_openevolve_arm(arm, args, summary, save, *, model, reasoning):
     seed_dir = arm_dir / '000_seed'
     seed_dir.mkdir(parents=True)
     work_dir.mkdir(parents=True)
-    arm_summary = {'model': model, 'generator': 'openevolve', 'selector': 'openevolve',
+    generator = 'openevolve_agent' if agent else 'openevolve'
+    arm_summary = {'model': model, 'generator': generator, 'selector': 'openevolve',
                    'trajectory': [], 'stop_reason': 'iterations',
                    'known_cost_usd': 0.0, 'cost_complete': True, 'failed_attempts': 0}
     summary['arms'][arm] = arm_summary
@@ -362,7 +438,7 @@ def run_openevolve_arm(arm, args, summary, save, *, model, reasoning):
     seed_row = {'arm': arm, 'iteration': 0, 'parent': None, 'path': str(seed_dir.resolve()), 'model': model,
                 'score': seed_evaluation['score'], 'best_score': seed_evaluation['score'],
                 'best_path': str(seed_dir.resolve()), 'elapsed_seconds': elapsed, 'error': None,
-                'status': 'seed', 'error_fatal': False, 'generator': 'openevolve', 'selector': 'openevolve',
+                'status': 'seed', 'error_fatal': False, 'generator': generator, 'selector': 'openevolve',
                 'selection_usage': {'input_tokens': 0, 'output_tokens': 0, 'estimated_cost_usd': 0.0,
                                     'observed_cost_usd': 0.0, 'model_invocations': 0},
                 'generation_usage': dict(usage), 'selected_parent_rank': None, 'selection_fallback': False,
@@ -380,14 +456,15 @@ def run_openevolve_arm(arm, args, summary, save, *, model, reasoning):
         save()
         return
     if not model:
-        raise RuntimeError('Set DIRECT_MODEL in .env')
+        raise RuntimeError(f'Set {"OPENCODE_MODEL" if agent else "DIRECT_MODEL"} in .env')
 
     settings = {'arm': arm, 'arm_dir': str(arm_dir.resolve()), 'work_dir': str(work_dir.resolve()),
                 'trace': str(Path(args.trace).resolve()), 'prototype': args.prototype, 'model': model,
                 'reasoning_effort': reasoning, 'timeout': args.timeout, 'budget_usd': args.budget_usd,
                 'budget_guard': bool(getattr(args, 'budget_guard', False)),
                 'budget_slack_usd': getattr(args, 'budget_slack_usd', 0),
-                'random_seed': random_seed_for(args.output)}
+                'random_seed': random_seed_for(args.output), 'agent': agent, 'generator': generator,
+                'agent_timeout': getattr(args, 'agent_timeout', None)}
     settings_path = work_dir / 'settings.json'
     write_json(settings_path, settings)
     os.environ[SETTINGS_ENV] = str(settings_path)

@@ -12,20 +12,26 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from .config import ROOT, EUDOXIA_REV, SCALES, TRACE, RESOURCE_TOLERANCE, default_agent_timeout, get_canonical_base_params
+from . import param_sweep
 from .evaluator import evaluate_scheduler
 from .generators import build_prompt, detect_opencode, opencode_version, generate_direct, generate_opencode, validate_code, write_json
 from .selection import SELECTOR_MAX_TOKENS, select_parent
 
 
 MODES = {'direct': ['direct'], 'opencode': ['opencode'], 'opencode_noeval': ['opencode_noeval'],
-         'openevolve': ['openevolve'],
+         'openevolve': ['openevolve'], 'openevolve_agent': ['openevolve_agent'],
          'both': ['direct', 'opencode'], 'all': ['direct', 'opencode', 'opencode_noeval'],
          'harnesses': ['openevolve', 'direct', 'opencode']}
 
 
+def uses_opencode(generator):
+    """Arms whose candidates come from OpenCode sessions, including OpenEvolve's search with the agent."""
+    return generator.startswith('opencode') or generator == 'openevolve_agent'
+
+
 def model_variable(generator):
     """OpenCode arms use OPENCODE_MODEL; the API-call arms (direct, openevolve) use DIRECT_MODEL."""
-    return 'OPENCODE_MODEL' if generator.startswith('opencode') else 'DIRECT_MODEL'
+    return 'OPENCODE_MODEL' if uses_opencode(generator) else 'DIRECT_MODEL'
 
 
 def best_candidate(pool):
@@ -142,7 +148,8 @@ def run_arm(arm, args, summary, save, *, generator=None, selector='best'):
                         generate_opencode(directory, prompt, model, args.agent_timeout, generation_usage,
                                           prototype=args.prototype, trace=args.trace,
                                           self_eval=generator == 'opencode', feedback=feedback,
-                                          max_self_tests=getattr(args, 'max_self_tests', None))
+                                          max_self_tests=getattr(args, 'max_self_tests', None),
+                                          param_sweep=generator == 'opencode' and getattr(args, 'param_sweep', False))
             except (SyntaxError, ValueError, TimeoutError) as exc:
                 # Invalid/missing candidate code or a deadline consumes an attempt.
                 error = f'{type(exc).__name__}: {exc}'
@@ -282,7 +289,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--mode', choices=list(MODES), default=os.getenv('RUN_MODE', 'both'),
                         help='both: direct and opencode; all: also opencode_noeval (the agent without ./evaluate); '
-                             'harnesses: openevolve, direct and opencode')
+                             "harnesses: openevolve, direct and opencode; openevolve_agent: OpenEvolve's search with an "
+                             'OpenCode session (with ./evaluate) making each edit')
     parser.add_argument('--selector', choices=['best', 'llm', 'compare'], default='best',
                         help='compare runs best and llm selectors with the same generator')
     parser.add_argument('--iterations', type=int, default=os.getenv('MAX_ITERATIONS', '3'), help='generated children per arm; 0 evaluates seeds only')
@@ -304,15 +312,24 @@ def main():
                              'aggregate score, from ./evaluate and for the parent in its prompt')
     parser.add_argument('--max-self-tests', type=int, default=None,
                         help='ablation (--mode opencode only): ./evaluate refuses after this many runs per session')
+    parser.add_argument('--openevolve-islands', type=int, default=None,
+                        help="OpenEvolve's number of islands (default: OpenEvolve's own); with agent sessions, "
+                             'few iterations fit a budget, so fewer islands let each one evolve')
+    parser.add_argument('--param-sweep', action='store_true',
+                        help='added capability (--mode opencode only): the agent also gets ./sweep NAME VALUE..., '
+                             'which evaluates scheduler.py with one module-level constant set to each value')
     args = parser.parse_args()
-    ablated = args.self_test_feedback != 'full' or args.max_self_tests is not None
+    ablated = args.self_test_feedback != 'full' or args.max_self_tests is not None or args.param_sweep
     if ablated and args.mode != 'opencode':
-        parser.error('--self-test-feedback and --max-self-tests apply only to --mode opencode')
+        parser.error('--self-test-feedback, --max-self-tests and --param-sweep apply only to --mode opencode')
+    if args.openevolve_islands is not None and (args.openevolve_islands < 1 or not any(
+            g.startswith('openevolve') for g in MODES[args.mode])):
+        parser.error('--openevolve-islands must be at least 1 and needs an openevolve arm')
     if args.max_self_tests is not None and args.max_self_tests < 1:
         parser.error('--max-self-tests must be at least 1')
     if args.selector == 'compare' and len(MODES[args.mode]) > 1:
         parser.error('--selector compare requires one generator: --mode direct, opencode or opencode_noeval')
-    if args.selector != 'best' and 'openevolve' in MODES[args.mode]:
+    if args.selector != 'best' and any(g.startswith('openevolve') for g in MODES[args.mode]):
         parser.error('OpenEvolve chooses its own parents; use --selector best with an openevolve arm')
     args.trace = args.trace.resolve()
     if not args.trace.is_file():
@@ -342,7 +359,7 @@ def main():
                 parser.error(f'Set the model for {arm} in {ROOT / ".env"}')
             if model.startswith('openai/') and not os.getenv('OPENAI_API_KEY'):
                 parser.error(f'Fill OPENAI_API_KEY in {ROOT / ".env"} before running')
-            if arm.startswith('opencode'):
+            if uses_opencode(arm):
                 try:
                     opencode_path = detect_opencode()[0]
                 except (RuntimeError, OSError, TimeoutError) as exc:
@@ -385,7 +402,9 @@ def main():
                'trace_snapshot': snapshot_trace_name(args.trace),
                'trace_sha256': hashlib.sha256(args.trace.read_bytes()).hexdigest(),
                'resource_tolerance': RESOURCE_TOLERANCE,
-               'self_test': {'feedback': args.self_test_feedback, 'max_runs': args.max_self_tests}}
+               'self_test': {'feedback': args.self_test_feedback, 'max_runs': args.max_self_tests,
+                             'param_sweep': ({'max_values': param_sweep.MAX_VALUES, 'parallel': param_sweep.PARALLEL}
+                                             if args.param_sweep else None)}}
     if args.start_scheduler is not None:
         # Start from a frozen copy, so a later edit to the source file cannot change this run.
         saved = args.output / 'snapshot' / 'start_scheduler.py'
@@ -407,10 +426,12 @@ def main():
     print('arm        iter      score   best_score   elapsed estimated_cost')
     save()
     for arm, generator, selector in conditions:
-        if generator == 'openevolve':
+        if generator in ('openevolve', 'openevolve_agent'):
             from .openevolve_arm import run_openevolve_arm
-            run_openevolve_arm(arm, args, summary, save, model=os.getenv('DIRECT_MODEL', ''),
-                               reasoning=os.getenv('DIRECT_REASONING_EFFORT'))
+            agent = generator == 'openevolve_agent'
+            run_openevolve_arm(arm, args, summary, save, model=os.getenv(model_variable(generator), ''),
+                               reasoning=os.getenv('OPENCODE_VARIANT' if agent else 'DIRECT_REASONING_EFFORT'),
+                               agent=agent)
         else:
             run_arm(arm, args, summary, save, generator=generator, selector=selector)
         if summary['arms'][arm]['stop_reason'] == 'harness_error':
