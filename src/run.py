@@ -6,11 +6,13 @@ import os
 import shutil
 import sys
 import time
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from importlib.metadata import version
 from pathlib import Path
 
 from dotenv import load_dotenv
+from .accounting import Accounting
 from .config import ROOT, EUDOXIA_REV, SCALES, TRACE, RESOURCE_TOLERANCE, default_agent_timeout, get_canonical_base_params
 from .evaluator import evaluate_scheduler
 from .generators import build_prompt, detect_opencode, generate_direct, generate_opencode, validate_code, write_json
@@ -20,16 +22,6 @@ from .selection import SELECTOR_MAX_TOKENS, select_parent
 def best_candidate(pool):
     valid = [c for c in pool if c['evaluation'].get('ok') and c['evaluation'].get('score') is not None]
     return min(valid, key=lambda c: c['evaluation']['score']) if valid else pool[0]
-
-
-def next_round_reserve(trajectory, generator, slack=0):
-    """Admission estimate; positive slack allows a near-budget final round."""
-    costs = [r['observed_cost_usd'] for r in trajectory if r['iteration']]
-    if slack > 0:
-        recent = costs[-3:]
-        return max(.01 if generator == 'direct' else .05,
-                   sum(recent) / len(recent) if recent else 0)
-    return max(.10 if generator == 'direct' else .60, 1.25 * max(costs, default=0))
 
 
 def restore_pool(arm_summary, arm_dir):
@@ -50,7 +42,9 @@ def restore_pool(arm_summary, arm_dir):
         evaluation = json.loads((directory / 'eval.json').read_text())
         if evaluation['score'] != row['score']:
             raise ValueError('Recorded evaluation changed; refusing resume')
-        pool.append({'path': row['path'], 'iteration': row['iteration'], 'evaluation': evaluation})
+        if not row.get('duplicate_source'):
+            pool.append({'path': row['path'], 'iteration': row['iteration'], 'evaluation': evaluation,
+                         'scheduler_sha256': code_hash})
     if {p.resolve() for p in arm_dir.iterdir() if p.is_dir()} != {Path(r['path']).resolve() for r in rows}:
         raise ValueError('Unrecorded candidate exists; inspect it before resume')
     total = sum(r['observed_cost_usd'] for r in rows)
@@ -59,7 +53,7 @@ def restore_pool(arm_summary, arm_dir):
     return pool
 
 
-def run_arm(arm, args, summary, save, *, generator=None, selector='best'):
+def run_arm(arm, args, summary, save, *, generator=None, selector='best', accountant=None):
     generator = generator or arm
     pool = []
     arm_dir = args.output / 'candidates' / arm
@@ -76,18 +70,11 @@ def run_arm(arm, args, summary, save, *, generator=None, selector='best'):
         pool = restore_pool(arm_summary, arm_dir)
         start = len(arm_summary['trajectory'])
         arm_summary['stop_reason'] = 'iterations'
-        arm_summary.pop('next_round_reserve_usd', None)
     summary['arms'][arm] = arm_summary
     for iteration in range(start, args.iterations + 1):
         if iteration and args.budget_usd is not None and arm_summary['known_cost_usd'] >= args.budget_usd:
             arm_summary['stop_reason'] = 'budget'
             break
-        if iteration and getattr(args, 'budget_guard', False) and args.budget_usd is not None:
-            slack = getattr(args, 'budget_slack_usd', 0)
-            reserve = next_round_reserve(arm_summary['trajectory'], generator, slack)
-            if args.budget_usd + slack - arm_summary['known_cost_usd'] < reserve:
-                arm_summary.update(stop_reason='budget_reserve', next_round_reserve_usd=reserve)
-                break
         started = time.monotonic()
         directory = arm_dir / ('000_seed' if iteration == 0 else f'{iteration:03d}')
         directory.mkdir(parents=True)
@@ -103,6 +90,8 @@ def run_arm(arm, args, summary, save, *, generator=None, selector='best'):
         selection_only = False
         stage = 'selection'
         if iteration:
+            if accountant is not None:
+                accountant.set_context(arm, directory)
             try:
                 if not model:
                     raise RuntimeError(f'Set {"DIRECT_MODEL" if generator == "direct" else "OPENCODE_MODEL"} in .env')
@@ -138,6 +127,11 @@ def run_arm(arm, args, summary, save, *, generator=None, selector='best'):
                 error_fatal = True
         else:
             (directory / 'prompt.txt').write_text('Identical seed; no model call.\n')
+        stop_path = directory / 'request-stop.json'
+        # The proxy refused a request because this arm reached its target: a budget stop, not a failure.
+        budget_stop = stop_path.exists() and json.loads(stop_path.read_text())['reason'] == 'target'
+        if budget_stop and error:
+            error_fatal = False
         if error or selection_only:
             evaluation = {'ok': False, 'score': None, 'error': error or 'Budget exhausted by selection'}
         else:
@@ -151,7 +145,12 @@ def run_arm(arm, args, summary, save, *, generator=None, selector='best'):
                 evaluation = {'ok': False, 'score': None, 'error': error}
         write_json(directory / 'eval.json', evaluation)
         candidate = {'path': str(directory.resolve()), 'iteration': iteration, 'evaluation': evaluation}
-        pool.append(candidate)
+        candidate_hash = hashlib.sha256((directory / 'scheduler.py').read_bytes()).hexdigest()
+        # Byte-identical source is not added to the pool again; the attempt is still recorded.
+        duplicate = any(c['scheduler_sha256'] == candidate_hash for c in pool)
+        candidate['scheduler_sha256'] = candidate_hash
+        if not duplicate:
+            pool.append(candidate)
         best = best_candidate(pool)
         if not iteration:
             status = 'seed'
@@ -179,6 +178,9 @@ def run_arm(arm, args, summary, save, *, generator=None, selector='best'):
         usage['observed_cost_usd'] = sum(p['observed_cost_usd'] for p in parts)
         for key in ('model_invocations', 'input_tokens', 'output_tokens'):
             usage[key] = sum(p[key] for p in parts) if all(p.get(key) is not None for p in parts) else None
+        if accountant is not None:
+            # Every request of this attempt, billed from the provider's usage by the proxy.
+            usage.update(accountant.attempt_usage(directory))
         cost = usage['estimated_cost_usd']
         if cost is None:
             arm_summary['cost_complete'] = False
@@ -194,7 +196,7 @@ def run_arm(arm, args, summary, save, *, generator=None, selector='best'):
                'selection_usage': selection_usage, 'generation_usage': generation_usage,
                'selected_parent_rank': decision.get('parent_rank'),
                'selection_fallback': decision.get('fallback', False),
-               'scheduler_sha256': hashlib.sha256((directory / 'scheduler.py').read_bytes()).hexdigest(),
+               'scheduler_sha256': candidate_hash, 'duplicate_source': duplicate,
                **usage}
         row['cumulative_cost_usd'] = arm_summary['known_cost_usd']
         row['cumulative_elapsed_seconds'] = sum(r['elapsed_seconds'] for r in arm_summary['trajectory']) + row['elapsed_seconds']
@@ -209,26 +211,33 @@ def run_arm(arm, args, summary, save, *, generator=None, selector='best'):
               f'{row["elapsed_seconds"]:>8.1f}s {fmt(cost):>14}', flush=True)
         if error:
             print(f'  {error}', file=sys.stderr)
-        if selection_only:
+        if selection_only or budget_stop:
             arm_summary['stop_reason'] = 'budget'
             break
         if error_fatal:
             arm_summary['stop_reason'] = 'harness_error' if stage == 'evaluation' else 'generation_error'
             break
-        if (getattr(args, 'selector', 'best') == 'compare' or getattr(args, 'budget_guard', False)) and not arm_summary['cost_complete']:
+        if not arm_summary['cost_complete']:
             arm_summary['stop_reason'] = 'cost_unknown'
             break
         if not iteration and not evaluation['ok']:
             arm_summary['stop_reason'] = 'seed_evaluation_failed'
             break
+    best = best_candidate(pool) if pool else None
+    test_trace = getattr(args, 'test_trace', None)
+    if test_trace is not None and best is not None and best['evaluation'].get('ok') and arm_summary['stop_reason'] in ('budget', 'iterations'):
+        # The training endpoint is fixed first; the held-out workload is evaluated once, after search.
+        test = evaluate_scheduler(Path(best['path']) / 'scheduler.py', prototype=args.prototype, trace=test_trace)
+        write_json(arm_dir / 'test_eval.json', test)
+        arm_summary['test'] = {'path': best['path'], 'trace': test_trace.name, 'score': test['score']}
     save()
 
 
-def snapshot_experiment(output, trace=TRACE):
+def snapshot_experiment(output, trace=TRACE, test_trace=None):
     """Explicit allowlist: capture research inputs, never .env or credentials."""
     names = ['src/' + name for name in [
         '__init__.py', 'run.py', 'config.py', 'evaluator.py', 'worker.py', 'generators.py',
-        'seed.py', 'analysis.py', 'selection.py', 'opencode.json',
+        'seed.py', 'analysis.py', 'selection.py', 'accounting.py', 'opencode.json',
         'prompts/system.md', 'prompts/context.md', 'prompts/selection.md']]
     names += ['pyproject.toml', 'uv.lock']
     hashes = {}
@@ -238,11 +247,14 @@ def snapshot_experiment(output, trace=TRACE):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, target)
         hashes[name] = hashlib.sha256(target.read_bytes()).hexdigest()
-    trace_name = f'scenarios/{trace.name}'
-    target = output / 'snapshot' / trace_name
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(trace, target)
-    hashes[trace_name] = hashlib.sha256(target.read_bytes()).hexdigest()
+    for kind, path in (('train', trace), ('test', test_trace)):
+        if path is None:
+            continue
+        name = f'scenarios/{kind}/{path.name}'
+        target = output / 'snapshot' / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, target)
+        hashes[name] = hashlib.sha256(target.read_bytes()).hexdigest()
     manifest = {
         'created_at_utc': datetime.now(timezone.utc).isoformat(),
         'python_version': sys.version,
@@ -261,11 +273,10 @@ def main():
     parser.add_argument('--iterations', type=int, default=os.getenv('MAX_ITERATIONS', '3'), help='generated children per arm; 0 evaluates seeds only')
     parser.add_argument('--prototype', action='store_true')
     parser.add_argument('--trace', type=Path, default=TRACE, help='CSV workload shared by both arms and agent self-tests')
-    parser.add_argument('--budget-usd', type=float, default=os.getenv('BUDGET_USD'), help='best-effort estimated spending limit per arm')
-    parser.add_argument('--budget-guard', action='store_true',
-                        help='stop before a round unless remaining budget covers a conservative cost estimate; stop on unknown cost')
-    parser.add_argument('--budget-slack-usd', type=float, default=0,
-                        help='with --budget-guard, use recent mean cost and allow projected overshoot by this amount; not a hard cap')
+    parser.add_argument('--test-trace', type=Path, default=None,
+                        help='held-out CSV evaluated once on each arm\'s final training best; default: scenarios/test/<trace name>')
+    parser.add_argument('--budget-usd', type=float, default=os.getenv('BUDGET_USD'),
+                        help='target per arm; requests stop once recorded cost reaches it; the last request may overshoot')
     parser.add_argument('--timeout', type=float, default=300, help='direct model-call timeout in seconds')
     parser.add_argument('--agent-timeout', type=float, default=None,
                         help='OpenCode session seconds; default: --timeout plus two full evaluator timeout budgets')
@@ -276,11 +287,16 @@ def main():
     args.trace = args.trace.resolve()
     if not args.trace.is_file():
         parser.error(f'Trace file does not exist: {args.trace}')
+    if args.test_trace is None and (ROOT / 'scenarios/test' / args.trace.name).is_file():
+        args.test_trace = ROOT / 'scenarios/test' / args.trace.name
+    if args.test_trace is not None:
+        args.test_trace = args.test_trace.resolve()
+        if not args.test_trace.is_file() or args.test_trace == args.trace:
+            parser.error(f'Test trace must be an existing file different from the training trace: {args.test_trace}')
     import math
     if args.iterations < 0 or not math.isfinite(args.timeout) or args.timeout <= 0 or (
         args.agent_timeout is not None and (not math.isfinite(args.agent_timeout) or args.agent_timeout <= 0)) or (
-        args.budget_usd is not None and (not math.isfinite(args.budget_usd) or args.budget_usd < 0)) or (
-        not math.isfinite(args.budget_slack_usd) or args.budget_slack_usd < 0):
+        args.budget_usd is not None and (not math.isfinite(args.budget_usd) or args.budget_usd < 0)):
         parser.error('iterations must be nonnegative; timeouts positive and finite; budget nonnegative and finite')
     if args.agent_timeout is None:
         args.agent_timeout = default_agent_timeout(args.prototype, args.timeout)
@@ -310,19 +326,17 @@ def main():
         parser.error('Output already contains results. Use --output runs/NEW_NAME for a fresh experiment.')
     validate_code((ROOT / 'src/seed.py').read_text())
     args.output.mkdir(parents=True, exist_ok=True)
-    run_config = {'schema_version': 3, **snapshot_experiment(args.output, args.trace),
+    run_config = {'schema_version': 4, **snapshot_experiment(args.output, args.trace, args.test_trace),
                'mode': args.mode, 'eudoxia_revision': EUDOXIA_REV, 'prototype': args.prototype,
                'selector': args.selector, 'selector_max_completion_tokens': SELECTOR_MAX_TOKENS,
                'conditions': {name: {'generator': g, 'selector': s} for name, g, s in conditions},
                'objective': 'geometric mean priority-weighted latency, lower is better; all scales required',
                'iterations': args.iterations, 'budget_usd_per_arm': args.budget_usd,
-               'budget_slack_usd': args.budget_slack_usd,
-               'budget_guard': ({'rule': 'reserve max(floor, mean(last 3 round costs)); allow projected cost <= budget + slack',
-                                 'direct_floor_usd': .01, 'opencode_floor_usd': .05, 'hard_cap': False}
-                                if args.budget_guard and args.budget_slack_usd > 0 else
-                                {'factor': 1.25, 'direct_floor_usd': .10, 'opencode_floor_usd': .60,
-                                 'rule': 'reserve max(floor, 1.25 * largest previous round cost); stop on unknown cost',
-                                 'hard_cap': False} if args.budget_guard else None),
+               'budget_rule': 'every request is billed by the local proxy from provider usage; once an arm reaches the target, '
+                              'further requests are refused (also mid-session); the last request may overshoot; unknown billing stops',
+               'pool_admission': 'every attempt is recorded; byte-identical source is not added to the pool again',
+               'test_trace': args.test_trace.name if args.test_trace else None,
+               'test_trace_sha256': hashlib.sha256(args.test_trace.read_bytes()).hexdigest() if args.test_trace else None,
                'direct_timeout_seconds': args.timeout, 'agent_timeout_seconds': args.agent_timeout,
                'direct_reasoning_effort': os.getenv('DIRECT_REASONING_EFFORT') or None,
                'opencode_variant': os.getenv('OPENCODE_VARIANT') or None,
@@ -332,8 +346,10 @@ def main():
                'scales': SCALES, 'trace': args.trace.name, 'trace_source': str(args.trace),
                'trace_sha256': hashlib.sha256(args.trace.read_bytes()).hexdigest(),
                'resource_tolerance': RESOURCE_TOLERANCE}
-    # Evaluate the saved workload so an edit to the source CSV cannot split the arms.
-    args.trace = args.output / 'snapshot' / 'scenarios' / args.trace.name
+    # Evaluate the saved workloads so an edit to a source CSV cannot split the arms.
+    args.trace = args.output / 'snapshot/scenarios/train' / args.trace.name
+    if args.test_trace is not None:
+        args.test_trace = args.output / 'snapshot/scenarios/test' / args.test_trace.name
     write_json(args.output / 'run_config.json', run_config)
     summary = {'status': 'running', 'run_config': 'run_config.json', 'arms': {}}
     def save():
@@ -342,10 +358,20 @@ def main():
         temp.replace(args.output / 'results.json')
     print('arm        iter      score   best_score   elapsed estimated_cost')
     save()
-    for arm, generator, selector in conditions:
-        run_arm(arm, args, summary, save, generator=generator, selector=selector)
-        if summary['arms'][arm]['stop_reason'] == 'harness_error':
-            break
+    with ExitStack() as stack:
+        accountant = None
+        if args.iterations > 0:
+            # Route every model request (litellm and OpenCode) through the billing proxy.
+            models = json.loads((ROOT / 'src/opencode.json').read_text())['provider']['openai']['models']
+            backend = os.getenv('OPENAI_BASE_URL') or os.getenv('OPENAI_API_BASE') or 'https://api.openai.com/v1'
+            accountant = Accounting(args.output, backend, os.environ['OPENAI_API_KEY'],
+                                    {name: m['cost'] for name, m in models.items()}, target=args.budget_usd)
+            proxy = stack.enter_context(accountant.serve())
+            os.environ.update(OPENAI_API_KEY='harness-proxy', OPENAI_BASE_URL=proxy, OPENAI_API_BASE=proxy)
+        for arm, generator, selector in conditions:
+            run_arm(arm, args, summary, save, generator=generator, selector=selector, accountant=accountant)
+            if summary['arms'][arm]['stop_reason'] in ('harness_error', 'cost_unknown'):
+                break
     failed = any(a['stop_reason'] in ('generation_error', 'harness_error', 'seed_evaluation_failed', 'cost_unknown') for a in summary['arms'].values())
     summary['status'] = 'needs_attention' if failed else 'complete'
     summary['finished_at_utc'] = datetime.now(timezone.utc).isoformat()

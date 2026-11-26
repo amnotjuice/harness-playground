@@ -12,6 +12,7 @@ sees concrete failure modes (OOM/timeout) rather than just an aggregate score.
 The dependency is pinned; an incompatible simulator must fail, not change scores.
 """
 import ast
+import builtins
 import json
 import math
 import sys
@@ -32,6 +33,29 @@ def validate_code(code):
     if any(keys != ['experiment'] for keys in registrations.values()):
         raise ValueError('Exactly one of each scheduler decorator must use key="experiment"')
     return code
+
+
+# Modules that reach files, processes or interpreter internals; no archived scheduler uses them.
+BLOCKED_MODULES = {'builtins', 'ctypes', 'fileinput', 'gc', 'glob', 'importlib', 'inspect', 'io', 'mmap',
+                   'os', 'pathlib', 'posix', 'shutil', 'socket', 'subprocess', 'sys', 'tempfile'}
+
+
+def scheduler_builtins():
+    """Builtins for scheduler code. Workload files hold true requirements, so scheduler code
+    cannot open files for reading. An in-process guard against reading the answer, not a
+    security boundary.
+    """
+    def guarded_open(file, mode='r', *args, **kwargs):
+        if '+' in mode or not set(mode) & set('wax'):
+            raise PermissionError('Scheduler code may not read files')
+        return open(file, mode, *args, **kwargs)
+
+    def guarded_import(name, *args, **kwargs):
+        if name.split('.')[0] in BLOCKED_MODULES:
+            raise ImportError(f'Scheduler code may not import {name}')
+        return builtins.__import__(name, *args, **kwargs)
+
+    return dict(vars(builtins), open=guarded_open, __import__=guarded_import)
 
 
 def verify_valid_assignment(pool, assignments):
@@ -70,7 +94,7 @@ def main() -> None:
         from eudoxia.workload.runtime_status import ASSIGNABLE_STATES
 
         exec(src, {
-            "__builtins__": __builtins__,
+            "__builtins__": scheduler_builtins(),
             "__name__": "__worker__",
             "List": List, "Tuple": Tuple,
             "Pipeline": Pipeline, "OperatorState": OperatorState,

@@ -224,6 +224,7 @@ def opencode_environment():
     for kind in ('DATA', 'CONFIG', 'CACHE', 'STATE'):
         env[f'XDG_{kind}_HOME'] = str(ROOT / '.tools/state' / kind.lower())
     env['OPENCODE_CONFIG'] = str(ROOT / 'src/opencode.json')
+    env['OPENCODE_DISABLE_MODELS_FETCH'] = '1'
     return env
 
 
@@ -301,7 +302,12 @@ def generate_opencode(directory, prompt, model, timeout, accounting, *, prototyp
     result = work / 'scheduler.py'
     if result.exists():
         shutil.copyfile(result, directory / 'scheduler.py')
-    if timed_out or proc.returncode or accounting['errors']:
+    stop = directory / 'request-stop.json'
+    # The billing proxy refused a request because the arm reached its target. The session
+    # ends there and its current scheduler.py is evaluated like any other candidate.
+    budget_stop = (stop.exists() and json.loads(stop.read_text())['reason'] == 'target'
+                   and all('HARNESS_STOP_target' in json.dumps(e) for e in accounting['errors']))
+    if timed_out or (not budget_stop and (proc.returncode or accounting['errors'])):
         # Keep the observed lower bound even though incomplete events cannot establish a total.
         accounting['estimated_cost_usd'] = None
         if timed_out:
