@@ -115,8 +115,6 @@ class ExperimentTests(unittest.TestCase):
                 old_rows = json.loads(json.dumps(summary['arms']['direct']['trajectory']))
                 args.resume = True
                 args.budget_usd = 1.1
-                args.budget_guard = True
-                args.budget_slack_usd = .2
                 run.run_arm('direct', args, summary, lambda: None)
                 arm = summary['arms']['direct']
                 self.assertEqual(call.call_count, 4)
@@ -134,32 +132,51 @@ class ExperimentTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'changed'):
                     run.restore_pool(arm, arm_dir)
 
-    def test_relaxed_budget_reserve_uses_recent_mean_without_large_floor(self):
-        rows = [{'iteration': i+1, 'observed_cost_usd': c} for i,c in enumerate([.8,.1,.2,.3])]
-        self.assertAlmostEqual(run.next_round_reserve(rows, 'opencode', slack=.1), .2)
-        self.assertAlmostEqual(run.next_round_reserve(rows, 'opencode'), 1.0)
+    def test_duplicate_source_is_recorded_but_not_added_to_pool(self):
+        with tempfile.TemporaryDirectory() as temp:
+            args = argparse.Namespace(output=Path(temp), trace=TRACE, iterations=3,
+                                      prototype=True, budget_usd=None, timeout=1, agent_timeout=2)
+            summary = {'arms': {}}
+            def generate(directory, prompt, model, timeout, usage, **kwargs):
+                (directory / 'scheduler.py').write_text((directory / 'scheduler.py').read_text().rstrip('\n# child\n') + '\n# child\n')
+                usage.update(estimated_cost_usd=.1, observed_cost_usd=.1, model_invocations=1)
+            with patch.dict(os.environ, {'DIRECT_MODEL': 'fake'}), \
+                 patch.object(run, 'build_prompt', return_value='task'), \
+                 patch.object(run, 'evaluate_scheduler', return_value={'ok': True, 'score': 10}), \
+                 patch.object(run, 'generate_direct', side_effect=generate):
+                run.run_arm('direct', args, summary, lambda: None)
+            rows = summary['arms']['direct']['trajectory']
+            self.assertEqual(len(rows), 4)
+            self.assertEqual([r['duplicate_source'] for r in rows], [False, False, True, True])
+            pool = run.restore_pool(summary['arms']['direct'], args.output / 'candidates/direct')
+            self.assertEqual(len(pool), 2)
 
-    def test_budget_guard_stops_before_unaffordable_round_or_unknown_cost(self):
-        for cost, stop, count in [(.49, 'budget_reserve', 3), (None, 'cost_unknown', 1)]:
-            with self.subTest(cost=cost), tempfile.TemporaryDirectory() as temp:
-                args = argparse.Namespace(output=Path(temp), trace=TRACE, iterations=20,
-                                          prototype=True, budget_usd=2, budget_guard=True,
-                                          timeout=1, agent_timeout=2)
-                summary = {'arms': {}}
-                def generate(directory, prompt, model, timeout, usage, **kwargs):
-                    usage.update(estimated_cost_usd=cost, observed_cost_usd=cost or .2,
-                                 model_invocations=1)
-                with patch.dict(os.environ, {'OPENCODE_MODEL': 'fake'}), \
-                     patch.object(run, 'evaluate_scheduler', return_value={'ok': True, 'score': 10}), \
-                     patch.object(run, 'build_prompt', return_value='task'), \
-                     patch.object(run, 'generate_opencode', side_effect=generate) as call:
-                    run.run_arm('opencode', args, summary, lambda: None)
-                arm = summary['arms']['opencode']
-                self.assertEqual(call.call_count, count)
-                self.assertEqual(arm['stop_reason'], stop)
-                self.assertLess(arm['known_cost_usd'], 2)
-        # The previous problematic $1.988/$2 endpoint must not start another session.
-        self.assertGreater(run.next_round_reserve([{'iteration': 1, 'observed_cost_usd': .45}], 'opencode'), .012)
+    def test_target_refusal_is_a_budget_stop_and_test_trace_is_evaluated_once(self):
+        with tempfile.TemporaryDirectory() as temp:
+            test_trace = Path(temp) / 'test.csv'
+            test_trace.write_text('held out')
+            args = argparse.Namespace(output=Path(temp), trace=TRACE, test_trace=test_trace, iterations=5,
+                                      prototype=True, budget_usd=1, timeout=1, agent_timeout=2)
+            summary = {'arms': {}}
+            def generate(directory, prompt, model, timeout, usage, **kwargs):
+                if directory.name == '002':
+                    (directory / 'request-stop.json').write_text('{"reason": "target"}')
+                    raise RuntimeError('HARNESS_STOP_target')
+                (directory / 'scheduler.py').write_text('# child\n' + (directory / 'scheduler.py').read_text())
+                usage.update(estimated_cost_usd=.2, observed_cost_usd=.2, model_invocations=1)
+            def evaluate(path, *, trace, **kwargs):
+                return {'ok': True, 'score': 1.0 if trace == test_trace else 10 - path.read_text().count('# child')}
+            with patch.dict(os.environ, {'DIRECT_MODEL': 'fake'}), \
+                 patch.object(run, 'build_prompt', return_value='task'), \
+                 patch.object(run, 'evaluate_scheduler', side_effect=evaluate) as ev, \
+                 patch.object(run, 'generate_direct', side_effect=generate):
+                run.run_arm('direct', args, summary, lambda: None)
+            arm = summary['arms']['direct']
+            self.assertEqual(arm['stop_reason'], 'budget')
+            self.assertFalse(arm['trajectory'][-1]['error_fatal'])
+            self.assertEqual([c.kwargs['trace'] for c in ev.call_args_list].count(test_trace), 1)
+            self.assertEqual(arm['test']['path'], arm['best_path'])
+            self.assertEqual(arm['test']['score'], 1.0)
 
     def test_confirmed_budget_prefix_survives_later_missing_costs(self):
         rows = [dict(iteration=i, observed_cost_usd=cost or .2, estimated_cost_usd=cost,
@@ -210,11 +227,11 @@ class ExperimentTests(unittest.TestCase):
             trace = root / 'custom.csv'
             trace.write_text('archived workload')
             manifest = run.snapshot_experiment(root, trace)
-            saved = root / 'snapshot/scenarios/custom.csv'
+            saved = root / 'snapshot/scenarios/train/custom.csv'
             trace.write_text('later source edit')
             self.assertEqual(saved.read_text(), 'archived workload')
-            self.assertIn('scenarios/custom.csv', manifest['sha256'])
-            self.assertNotIn('scenarios/hard.csv', manifest['sha256'])
+            self.assertIn('scenarios/train/custom.csv', manifest['sha256'])
+            self.assertNotIn('scenarios/train/hard.csv', manifest['sha256'])
             args = argparse.Namespace(output=root, trace=saved, iterations=1, prototype=True,
                                       budget_usd=1, timeout=1, agent_timeout=2)
             summary = {'arms': {}}
@@ -302,8 +319,8 @@ class ExperimentTests(unittest.TestCase):
                 self.assertEqual(len(arm['trajectory']), 3)
             self.assertNotEqual(summary['arms']['direct']['best_path'], summary['arms']['opencode']['best_path'])
 
-    def test_budget_stops_after_known_cost_and_unknown_uses_iterations(self):
-        for cost, expected in [(0.6, 3), (None, 5)]:
+    def test_budget_stops_after_known_cost_and_unknown_cost_stops(self):
+        for cost, expected in [(0.6, 3), (None, 2)]:
             with tempfile.TemporaryDirectory() as temp:
                 args = argparse.Namespace(output=Path(temp), trace=TRACE, iterations=4, prototype=True,
                                           budget_usd=1.0, timeout=1, agent_timeout=2)
@@ -317,7 +334,7 @@ class ExperimentTests(unittest.TestCase):
                     run.run_arm('direct', args, summary, lambda: None)
                 arm = summary['arms']['direct']
                 self.assertEqual(len(arm['trajectory']), expected)
-                self.assertEqual(arm['stop_reason'], 'budget' if cost else 'iterations')
+                self.assertEqual(arm['stop_reason'], 'budget' if cost else 'cost_unknown')
                 if cost is None:
                     self.assertIsNone(arm['estimated_cost_usd'])
 
@@ -385,7 +402,7 @@ class ExperimentTests(unittest.TestCase):
                 run.run_arm('opencode', args, summary, lambda: None)
             arm = summary['arms']['opencode']
             self.assertEqual(len(arm['trajectory']), 2)  # seed + one paid timeout
-            self.assertEqual(arm['stop_reason'], 'budget')
+            self.assertEqual(arm['stop_reason'], 'cost_unknown')
             self.assertAlmostEqual(arm['known_cost_usd'], .4)
             self.assertFalse(arm['cost_complete'])
             self.assertIsNone(arm['estimated_cost_usd'])
@@ -473,6 +490,28 @@ class ExperimentTests(unittest.TestCase):
                             generators.generate_opencode(directory, 'task', 'fake', .1 if behavior == 'timeout' else 2, {})
                 self.assertTrue((directory / 'response.txt').exists())
 
+    def test_opencode_session_cut_at_target_keeps_its_edit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            cli = base / 'fake-opencode'
+            error = {'type': 'error', 'error': {'name': 'APIError', 'data': {'message': 'HARNESS_STOP_target'}}}
+            cli.write_text('#!/usr/bin/env python3\nfrom pathlib import Path\np=Path("scheduler.py")\n'
+                           'p.write_text(p.read_text()+"\\n# edited\\n")\n'
+                           f'print({json.dumps(error)!r})\nraise SystemExit(1)\n')
+            cli.chmod(0o755)
+            for reason, raises in (('target', False), ('unknown_billing', True)):
+                directory = base / reason
+                directory.mkdir()
+                (directory / 'scheduler.py').write_text((ROOT / 'src/seed.py').read_text())
+                (directory / 'request-stop.json').write_text(json.dumps({'reason': reason}))
+                with patch('src.generators.detect_opencode', return_value=(str(cli), '--model --format')):
+                    if raises:
+                        with self.assertRaises(RuntimeError):
+                            generators.generate_opencode(directory, 'task', 'fake', 5, {}, prototype=True)
+                    else:
+                        generators.generate_opencode(directory, 'task', 'fake', 5, {}, prototype=True)
+                        self.assertIn('# edited', (directory / 'scheduler.py').read_text())
+
     def test_direct_one_call_no_retries(self):
         from unittest.mock import Mock
         response = Mock()
@@ -544,7 +583,8 @@ class ExperimentTests(unittest.TestCase):
                  patch.object(run, 'evaluate_scheduler', return_value={'ok': True, 'score': 10}), \
                  patch.object(run, 'build_prompt', return_value='task'), \
                  patch.object(run, 'generate_direct', side_effect=RuntimeError('authentication failed')) as direct, \
-                 patch.object(run, 'generate_opencode') as agent:
+                 patch.object(run, 'generate_opencode', side_effect=lambda *a, **k: a[4].update(
+                     estimated_cost_usd=.1, observed_cost_usd=.1, model_invocations=1)) as agent:
                 run.run_arm('direct', args, summary, lambda: None)
                 run.run_arm('opencode', args, summary, lambda: None)
             self.assertEqual(direct.call_count, 1)
