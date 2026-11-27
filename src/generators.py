@@ -219,13 +219,47 @@ def generate_direct(directory, prompt, model, timeout, accounting):
     validate_code(code)
 
 
-def opencode_environment():
-    env = os.environ.copy()
+# OpenCode receives only these variables, as in the archived experiment drivers. Without
+# HOME it cannot load user-level instructions such as ~/.claude/CLAUDE.md.
+OPENCODE_ENV_KEYS = ('PATH', 'LANG', 'LC_ALL', 'SHELL', 'OPENAI_API_KEY', 'OPENAI_BASE_URL')
+
+
+def opencode_environment(state=ROOT / '.tools/state'):
+    env = {key: os.environ[key] for key in OPENCODE_ENV_KEYS if key in os.environ}
     for kind in ('DATA', 'CONFIG', 'CACHE', 'STATE'):
-        env[f'XDG_{kind}_HOME'] = str(ROOT / '.tools/state' / kind.lower())
+        env[f'XDG_{kind}_HOME'] = str(state / kind.lower())
     env['OPENCODE_CONFIG'] = str(ROOT / 'src/opencode.json')
     env['OPENCODE_DISABLE_MODELS_FETCH'] = '1'
     return env
+
+
+def sandbox_profile(directory, trace):
+    """Deny-by-default macOS sandbox from the archived native drivers.
+
+    The session may read system files, the interpreter, OpenCode, the shared source, the
+    training workload and its own attempt, and write only its own attempt. Other runs, the
+    held-out workload, docs/ and the repository's AGENTS.md stay unreadable; the network
+    stays open for the billing proxy and native web tools.
+    """
+    directory = directory.resolve()
+    work, state, internal = directory / 'workspace', directory / 'native-state', directory / 'internal_evals'
+    executable, _ = detect_opencode()
+    reads = ['/System', '/Library', '/usr', '/opt/homebrew', '/dev', '/private/var/db/timezone',
+             str(Path(sys.prefix).resolve()), str(Path(executable).resolve()), str(ROOT / 'src'),
+             str(work), str(state), str(internal)]
+    trace = trace.resolve()
+    literals = [str(trace)] + [str(p) for p in trace.parents] + [str(p) for p in Path(sys.executable).parents]
+    writes = [str(work), str(state), str(internal)]
+    rules = ['(version 1)', '(deny default)', '(allow process*)', '(allow signal (target children))',
+             '(allow sysctl-read)', '(allow mach-lookup)', '(allow file-read-metadata)',
+             '(allow file-map-executable)', '(allow network*)', '(allow ipc-posix-shm-read-data)',
+             '(allow file-read* ' + ' '.join(f'(subpath {json.dumps(p)})' for p in reads) + ' '
+             + ' '.join(f'(literal {json.dumps(p)})' for p in literals) + ')',
+             '(allow file-write* ' + ' '.join(f'(subpath {json.dumps(p)})' for p in writes)
+             + ' (literal "/dev/null"))']
+    profile = directory / 'native-sandbox.sb'
+    profile.write_text('\n'.join(rules) + '\n')
+    return profile
 
 
 def detect_opencode():
@@ -280,17 +314,26 @@ def generate_opencode(directory, prompt, model, timeout, accounting, *, prototyp
     original = (directory / 'scheduler.py').read_text()
     (work / 'scheduler.py').write_text(original)
     (work / 'task.md').write_text(rendered)
-    cmd = [executable, 'run', '--dir', str(work.resolve()), '--model', model, '--format', 'json']
+    # Each session gets fresh OpenCode state, so no session can read another's history.
+    state = directory / 'native-state'
+    state.mkdir()
+    (directory / 'internal_evals').mkdir(exist_ok=True)
+    profile = sandbox_profile(directory, trace)
+    cmd = ['/usr/bin/sandbox-exec', '-f', str(profile),
+           executable, 'run', '--dir', str(work.resolve()), '--model', model, '--format', 'json']
     if os.getenv('OPENCODE_VARIANT'):
         cmd += ['--variant', os.environ['OPENCODE_VARIANT']]
     cmd += ['Read task.md and edit scheduler.py as instructed.']
     write_json(directory / 'command.json', {'argv': cmd, 'cwd': str(work.resolve())})
-    env = opencode_environment()
+    env = opencode_environment(state.resolve())
+    env['TMPDIR'] = str(state.resolve())
     # OpenCode resolves its root from PWD before falling back to process.cwd().
     # subprocess cwd alone leaves the parent's PWD pointing at the project root.
     env['PWD'] = str(work.resolve())
     with (directory / 'response.txt').open('w') as out, (directory / 'stderr.txt').open('w') as err:
-        proc = subprocess.Popen(cmd, cwd=work, stdout=out, stderr=err, start_new_session=True, env=env)
+        # Without a closed stdin, `opencode run` started from a non-terminal waits for piped input.
+        proc = subprocess.Popen(cmd, cwd=work, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                                start_new_session=True, env=env)
         timed_out = False
         try:
             proc.wait(timeout=timeout)

@@ -233,15 +233,26 @@ def run_arm(arm, args, summary, save, *, generator=None, selector='best', accoun
     save()
 
 
+# Explicit allowlist: capture research inputs, never .env or credentials.
+SNAPSHOT_FILES = ['src/' + name for name in [
+    '__init__.py', 'run.py', 'config.py', 'evaluator.py', 'worker.py', 'generators.py',
+    'seed.py', 'analysis.py', 'selection.py', 'accounting.py', 'opencode.json',
+    'prompts/system.md', 'prompts/context.md', 'prompts/selection.md']] + ['pyproject.toml', 'uv.lock']
+
+
+def snapshot_hashes(trace=TRACE, test_trace=None):
+    """Hashes of the live inputs a snapshot would capture, for checking a resume."""
+    paths = {name: ROOT / name for name in SNAPSHOT_FILES}
+    for kind, path in (('train', trace), ('test', test_trace)):
+        if path is not None:
+            paths[f'scenarios/{kind}/{path.name}'] = path
+    return {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in paths.items()}
+
+
 def snapshot_experiment(output, trace=TRACE, test_trace=None):
-    """Explicit allowlist: capture research inputs, never .env or credentials."""
-    names = ['src/' + name for name in [
-        '__init__.py', 'run.py', 'config.py', 'evaluator.py', 'worker.py', 'generators.py',
-        'seed.py', 'analysis.py', 'selection.py', 'accounting.py', 'opencode.json',
-        'prompts/system.md', 'prompts/context.md', 'prompts/selection.md']]
-    names += ['pyproject.toml', 'uv.lock']
+    """Copy the research inputs next to the results and record their hashes."""
     hashes = {}
-    for name in names:
+    for name in SNAPSHOT_FILES:
         source = ROOT / name
         target = output / 'snapshot' / name
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -281,7 +292,11 @@ def main():
     parser.add_argument('--agent-timeout', type=float, default=None,
                         help='OpenCode session seconds; default: --timeout plus two full evaluator timeout budgets')
     parser.add_argument('--output', type=Path, default=None, help='default: a fresh timestamped directory under runs/')
+    parser.add_argument('--resume', action='store_true',
+                        help='continue the interrupted run in --output from its saved state, with unchanged settings and source')
     args = parser.parse_args()
+    if args.resume and args.output is None:
+        parser.error('--resume requires --output')
     if args.selector == 'compare' and args.mode == 'both':
         parser.error('--selector compare requires one generator: --mode direct or opencode')
     args.trace = args.trace.resolve()
@@ -321,37 +336,52 @@ def main():
                     detect_opencode()
                 except (RuntimeError, OSError, TimeoutError) as exc:
                     parser.error(str(exc))
-    if (args.output / 'run_config.json').exists() or (args.output / 'results.json').exists() or any(
+    if args.resume:
+        saved = json.loads((args.output / 'run_config.json').read_text())
+        # A resumed run must execute the same source, data and settings it started with.
+        current = snapshot_hashes(args.trace, args.test_trace)
+        changed = [name for name in saved['sha256'] if current.get(name) != saved['sha256'][name]]
+        settings = {'mode': args.mode, 'selector': args.selector, 'iterations': args.iterations,
+                    'budget_usd_per_arm': args.budget_usd, 'prototype': args.prototype,
+                    'direct_timeout_seconds': args.timeout, 'agent_timeout_seconds': args.agent_timeout}
+        changed += [key for key, value in settings.items() if saved[key] != value]
+        if changed:
+            parser.error(f'Cannot resume; changed since the run started: {", ".join(changed)}')
+        summary = json.loads((args.output / 'results.json').read_text())
+        summary['status'] = 'running'
+    elif (args.output / 'run_config.json').exists() or (args.output / 'results.json').exists() or any(
         (args.output / 'candidates' / arm).exists() and any((args.output / 'candidates' / arm).iterdir()) for arm in arms):
-        parser.error('Output already contains results. Use --output runs/NEW_NAME for a fresh experiment.')
+        parser.error('Output already contains results. Use --output runs/NEW_NAME for a fresh experiment, or --resume.')
     validate_code((ROOT / 'src/seed.py').read_text())
     args.output.mkdir(parents=True, exist_ok=True)
-    run_config = {'schema_version': 4, **snapshot_experiment(args.output, args.trace, args.test_trace),
-               'mode': args.mode, 'eudoxia_revision': EUDOXIA_REV, 'prototype': args.prototype,
-               'selector': args.selector, 'selector_max_completion_tokens': SELECTOR_MAX_TOKENS,
-               'conditions': {name: {'generator': g, 'selector': s} for name, g, s in conditions},
-               'objective': 'geometric mean priority-weighted latency, lower is better; all scales required',
-               'iterations': args.iterations, 'budget_usd_per_arm': args.budget_usd,
-               'budget_rule': 'every request is billed by the local proxy from provider usage; once an arm reaches the target, '
-                              'further requests are refused (also mid-session); the last request may overshoot; unknown billing stops',
-               'pool_admission': 'every attempt is recorded; byte-identical source is not added to the pool again',
-               'test_trace': args.test_trace.name if args.test_trace else None,
-               'test_trace_sha256': hashlib.sha256(args.test_trace.read_bytes()).hexdigest() if args.test_trace else None,
-               'direct_timeout_seconds': args.timeout, 'agent_timeout_seconds': args.agent_timeout,
-               'direct_reasoning_effort': os.getenv('DIRECT_REASONING_EFFORT') or None,
-               'opencode_variant': os.getenv('OPENCODE_VARIANT') or None,
-               'models': {name: os.getenv('DIRECT_MODEL' if g == 'direct' else 'OPENCODE_MODEL', '')
-                          for name, g, _ in conditions},
-               'simulation_params': get_canonical_base_params(args.prototype),
-               'scales': SCALES, 'trace': args.trace.name, 'trace_source': str(args.trace),
-               'trace_sha256': hashlib.sha256(args.trace.read_bytes()).hexdigest(),
-               'resource_tolerance': RESOURCE_TOLERANCE}
+    if not args.resume:
+        run_config = {'schema_version': 4, **snapshot_experiment(args.output, args.trace, args.test_trace),
+                   'mode': args.mode, 'eudoxia_revision': EUDOXIA_REV, 'prototype': args.prototype,
+                   'selector': args.selector, 'selector_max_completion_tokens': SELECTOR_MAX_TOKENS,
+                   'conditions': {name: {'generator': g, 'selector': s} for name, g, s in conditions},
+                   'objective': 'geometric mean priority-weighted latency, lower is better; all scales required',
+                   'iterations': args.iterations, 'budget_usd_per_arm': args.budget_usd,
+                   'budget_rule': 'every request is billed by the local proxy from provider usage; once an arm reaches the target, '
+                                  'further requests are refused (also mid-session); the last request may overshoot; unknown billing stops',
+                   'pool_admission': 'every attempt is recorded; byte-identical source is not added to the pool again',
+                   'test_trace': args.test_trace.name if args.test_trace else None,
+                   'test_trace_sha256': hashlib.sha256(args.test_trace.read_bytes()).hexdigest() if args.test_trace else None,
+                   'direct_timeout_seconds': args.timeout, 'agent_timeout_seconds': args.agent_timeout,
+                   'direct_reasoning_effort': os.getenv('DIRECT_REASONING_EFFORT') or None,
+                   'opencode_variant': os.getenv('OPENCODE_VARIANT') or None,
+                   'models': {name: os.getenv('DIRECT_MODEL' if g == 'direct' else 'OPENCODE_MODEL', '')
+                              for name, g, _ in conditions},
+                   'simulation_params': get_canonical_base_params(args.prototype),
+                   'scales': SCALES, 'trace': args.trace.name, 'trace_source': str(args.trace),
+                   'trace_sha256': hashlib.sha256(args.trace.read_bytes()).hexdigest(),
+                   'resource_tolerance': RESOURCE_TOLERANCE}
     # Evaluate the saved workloads so an edit to a source CSV cannot split the arms.
     args.trace = args.output / 'snapshot/scenarios/train' / args.trace.name
     if args.test_trace is not None:
         args.test_trace = args.output / 'snapshot/scenarios/test' / args.test_trace.name
-    write_json(args.output / 'run_config.json', run_config)
-    summary = {'status': 'running', 'run_config': 'run_config.json', 'arms': {}}
+    if not args.resume:
+        write_json(args.output / 'run_config.json', run_config)
+        summary = {'status': 'running', 'run_config': 'run_config.json', 'arms': {}}
     def save():
         temp = args.output / 'results.json.tmp'
         write_json(temp, summary)
@@ -368,7 +398,12 @@ def main():
                                     {name: m['cost'] for name, m in models.items()}, target=args.budget_usd)
             proxy = stack.enter_context(accountant.serve())
             os.environ.update(OPENAI_API_KEY='harness-proxy', OPENAI_BASE_URL=proxy, OPENAI_API_BASE=proxy)
+        resume = args.resume
         for arm, generator, selector in conditions:
+            # Resume only arms that already started; an arm with its held-out result is finished.
+            args.resume = resume and arm in summary['arms']
+            if args.resume and 'test' in summary['arms'][arm]:
+                continue
             run_arm(arm, args, summary, save, generator=generator, selector=selector, accountant=accountant)
             if summary['arms'][arm]['stop_reason'] in ('harness_error', 'cost_unknown'):
                 break

@@ -490,6 +490,29 @@ class ExperimentTests(unittest.TestCase):
                             generators.generate_opencode(directory, 'task', 'fake', .1 if behavior == 'timeout' else 2, {})
                 self.assertTrue((directory / 'response.txt').exists())
 
+    def test_opencode_session_is_isolated(self):
+        # A fake CLI runs under the real sandbox and reports what it can see.
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            cli = base / 'fake-opencode'
+            probes = {'agents': str(ROOT / 'AGENTS.md'), 'test_trace': str(ROOT / 'scenarios/test/hard.csv'),
+                      'readme': str(ROOT / 'README.md')}
+            cli.write_text('#!/usr/bin/env python3\nimport json, os\n'
+                           f'probes = {probes!r}\nseen = {{}}\n'
+                           'for name, path in probes.items():\n'
+                           '    try:\n        open(path).read(1); seen[name] = True\n'
+                           '    except OSError:\n        seen[name] = False\n'
+                           'seen["home"] = "HOME" in os.environ\n'
+                           'open("seen.json", "w").write(json.dumps(seen))\n')
+            cli.chmod(0o755)
+            directory = base / 'attempt'
+            directory.mkdir()
+            (directory / 'scheduler.py').write_text((ROOT / 'src/seed.py').read_text())
+            with patch('src.generators.detect_opencode', return_value=(str(cli), '--model --format')):
+                generators.generate_opencode(directory, 'task', 'fake', 10, {}, prototype=True)
+            seen = json.loads((directory / 'workspace/seen.json').read_text())
+            self.assertEqual(seen, {'agents': False, 'test_trace': False, 'readme': False, 'home': False})
+
     def test_opencode_session_cut_at_target_keeps_its_edit(self):
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp)
